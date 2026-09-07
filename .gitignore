@@ -1,0 +1,29 @@
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Build output
+out/
+out_test/
+
+# Test/build artifacts
+coverage/
+
+# Local CodeSense runtime data
+.codesense/
+
+# Generated JS artifacts accidentally emitted under TypeScript source
+src/**/*.js
+src/**/*.js.map
+
+# VS Code local workspace configuration
+.vscode/*.log
+.vscode/*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db

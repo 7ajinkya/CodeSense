@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2020",
+    "outDir": "out/test",
+    "lib": ["ES2020"],
+    "sourceMap": true,
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "composite": false,
+    "baseUrl": ".",
+    "paths": {
+      "codesense/*": ["src/*"]
+    },
+    "types": ["mocha", "chai", "node"]
+  },
+  "include": ["test/**/*", "src/**/*"],
+  "exclude": ["node_modules", ".vscode-test", "out"]
+}

@@ -1,0 +1,106 @@
+{
+  "name": "codesense",
+  "displayName": "CodeSense",
+  "description": "An adaptive coding companion that learns from how a learner solves problems, not just whether they solved them. Phase 1: problem-solving environment with evidence capture, plus an opt-in AI coaching layer.",
+  "version": "0.2.0",
+  "publisher": "codesense",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:codesense.startSession",
+    "onCommand:codesense.endSession",
+    "onCommand:codesense.startProblem",
+    "onCommand:codesense.endProblem",
+    "onCommand:codesense.setProblemState",
+    "onCommand:codesense.showProblemHistory",
+    "onCommand:codesense.showMenu",
+    "onCommand:codesense.showTimeline",
+    "onCommand:codesense.showSessionDataLocation",
+    "onCommand:codesense.evaluateNow",
+    "onView:codesense.sidebar"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codesense",
+          "title": "CodeSense",
+          "icon": "media/codesense.svg"
+        }
+      ]
+    },
+    "views": {
+      "codesense": [
+        {
+          "id": "codesense.sidebar",
+          "name": "CodeSense",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codesense.startSession",
+        "title": "CodeSense: Start Coding Session"
+      },
+      {
+        "command": "codesense.endSession",
+        "title": "CodeSense: End Coding Session"
+      },
+      {
+        "command": "codesense.startProblem",
+        "title": "CodeSense: Start Problem"
+      },
+      {
+        "command": "codesense.endProblem",
+        "title": "CodeSense: End Problem"
+      },
+      {
+        "command": "codesense.setProblemState",
+        "title": "CodeSense: Set Problem State"
+      },
+      {
+        "command": "codesense.showProblemHistory",
+        "title": "CodeSense: Show Problem History"
+      },
+      {
+        "command": "codesense.evaluateNow",
+        "title": "CodeSense: Request AI Check-in Now"
+      },
+      {
+        "command": "codesense.showMenu",
+        "title": "CodeSense: Open Menu"
+      },
+      {
+        "command": "codesense.showTimeline",
+        "title": "CodeSense: Show Session Timeline"
+      },
+      {
+        "command": "codesense.showSessionDataLocation",
+        "title": "CodeSense: Show Session Data Location"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "compile:test": "tsc -p ./tsconfig.test.json",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && npm run compile:test && mocha --require tsconfig-paths/register out/test/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "20.x",
+    "@types/vscode": "^1.80.0",
+    "chai": "^6.2.2",
+    "mocha": "^10.3.0",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.4.5"
+  }
+}
