@@ -2,7 +2,7 @@
   "name": "codesense",
   "displayName": "CodeSense",
   "description": "An adaptive coding companion that learns from how a learner solves problems, not just whether they solved them. Phase 1: problem-solving environment with evidence capture, plus an opt-in AI coaching layer.",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "publisher": "codesense",
   "engines": {
     "vscode": "^1.80.0"
@@ -102,5 +102,8 @@
     "mocha": "^10.3.0",
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
   }
 }

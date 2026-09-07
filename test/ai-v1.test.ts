@@ -15,7 +15,7 @@ import {
   COACHING_SYSTEM_PROMPT,
   renderContextForPrompt,
 } from 'codesense/ai/aiPrompt';
-import { DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, readAiConfig } from 'codesense/ai/aiConfig';
+import { DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, loadWorkspaceEnvFile, readAiConfig } from 'codesense/ai/aiConfig';
 import {
   FakeReasoner,
   HttpChatReasoner,
@@ -218,6 +218,88 @@ describe('AI configuration', () => {
     expect(config.enabled).to.be.true;
     expect(config.baseUrl).to.equal('http://127.0.0.1:11434/v1');
     expect(config.timeoutMs).to.be.greaterThan(0);
+  });
+
+  it('loads workspace .env values into readAiConfig', () => {
+    const dir = path.join(os.tmpdir(), 'codesense-test-dotenv-present');
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.env'),
+      'CODESENSE_AI_API_KEY=dotenv-test-key\n' +
+        'CODESENSE_AI_BASE_URL=http://127.0.0.1:11434/v1\n' +
+        'CODESENSE_AI_MODEL=dotenv-test-model\n' +
+        'CODESENSE_AI_TIMEOUT_MS=7000\n',
+    );
+    try {
+      delete process.env.CODESENSE_AI_API_KEY;
+      delete process.env.CODESENSE_AI_BASE_URL;
+      delete process.env.CODESENSE_AI_MODEL;
+      delete process.env.CODESENSE_AI_TIMEOUT_MS;
+      loadWorkspaceEnvFile(dir);
+      const config = readAiConfig();
+      expect(config.enabled).to.be.true;
+      expect(config.apiKey).to.equal('dotenv-test-key');
+      expect(config.baseUrl).to.equal('http://127.0.0.1:11434/v1');
+      expect(config.model).to.equal('dotenv-test-model');
+      expect(config.timeoutMs).to.equal(7000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('never lets .env override explicitly set environment variables', () => {
+    const dir = path.join(os.tmpdir(), 'codesense-test-dotenv-precedence');
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.env'),
+      'CODESENSE_AI_MODEL=dotenv-model\nCODESENSE_AI_TIMEOUT_MS=7000\n',
+    );
+    try {
+      process.env.CODESENSE_AI_MODEL = 'explicit-model';
+      delete process.env.CODESENSE_AI_TIMEOUT_MS;
+      loadWorkspaceEnvFile(dir);
+      const config = readAiConfig();
+      expect(config.model).to.equal('explicit-model');
+      expect(config.timeoutMs).to.equal(7000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is a silent no-op when .env is missing or there is no workspace', () => {
+    const dir = path.join(os.tmpdir(), 'codesense-test-dotenv-absent');
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      delete process.env.CODESENSE_AI_API_KEY;
+      delete process.env.CODESENSE_AI_BASE_URL;
+      loadWorkspaceEnvFile(dir);
+      loadWorkspaceEnvFile(undefined);
+      expect(process.env.CODESENSE_AI_API_KEY ?? '').to.equal('');
+      expect(process.env.CODESENSE_AI_BASE_URL ?? '').to.equal('');
+      expect(readAiConfig().enabled).to.be.false;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ships a valid .env.example with placeholder values and no secrets', function () {
+    const examplePath = path.join(process.cwd(), '.env.example');
+    if (!fs.existsSync(examplePath)) {
+      this.skip();
+    }
+    const content = fs.readFileSync(examplePath, 'utf-8');
+    for (const key of [
+      'CODESENSE_AI_API_KEY',
+      'CODESENSE_AI_BASE_URL',
+      'CODESENSE_AI_MODEL',
+      'CODESENSE_AI_TIMEOUT_MS',
+    ]) {
+      expect(content, `missing key ${key}`).to.contain(key);
+    }
+    expect(content).to.not.match(/sk-[A-Za-z0-9]{8,}/);
   });
 });
 

@@ -64,7 +64,7 @@ import {
 import { EvaluationTriggerKind, generateConversationMessageId } from './ai/aiTypes';
 import { HttpChatReasoner } from './ai/reasoners';
 import { LocalAiStore } from './ai/aiStore';
-import { readAiConfig } from './ai/aiConfig';
+import { loadWorkspaceEnvFile, readAiConfig } from './ai/aiConfig';
 import { EvaluationOutcome, runAiEvaluation } from './ai/evaluationRunner';
 import { buildAIContext } from './context/aiContext';
 import { editRecordsFromEvents, selectAttemptEdits } from './history/codeHistory';
@@ -1071,6 +1071,10 @@ function showSessionDataLocation(): void {
 
 export function activate(context: vscode.ExtensionContext): void {
   console.log('CodeSense extension activated');
+  // Project-local AI configuration: <workspace-root>/.env is loaded into
+  // process.env before anything reads it. No workspace or no .env is a
+  // silent no-op; explicit environment variables keep working as before.
+  loadWorkspaceEnvFile(workspaceFsPath());
   rebindStores();
   statusBar = new CodeSenseStatusBar();
   refreshStatusBar();

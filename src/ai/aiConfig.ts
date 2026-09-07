@@ -6,10 +6,17 @@
  *   CODESENSE_AI_MODEL        Default: gpt-4o-mini
  *   CODESENSE_AI_TIMEOUT_MS   Default: 60000
  *
+ * Values may come from a project-root `.env` file (loaded once at extension
+ * startup via `loadWorkspaceEnvFile`) or from the process environment
+ * directly. Explicitly set environment variables always win over `.env`.
+ *
  * Nothing secret is ever committed or stored in source. The extension reads
  * configuration at evaluation time so tests and harnesses can inject values
  * through process.env without touching product code.
  */
+
+import * as path from 'path';
+import * as dotenv from 'dotenv';
 
 export const DEFAULT_AI_BASE_URL = 'https://api.openai.com/v1';
 export const DEFAULT_AI_MODEL = 'gpt-4o-mini';
@@ -29,6 +36,26 @@ export interface AiConfig {
 
 function env(name: string): string {
   return (process.env[name] ?? '').trim();
+}
+
+/**
+ * Load `<workspaceRoot>/.env` into process.env, once, at extension startup.
+ *
+ * - No workspace root (or no `.env` file there) is a silent no-op: the
+ *   existing environment-variable behavior remains the fallback.
+ * - Variables already present in the environment are never overridden;
+ *   explicit environment always wins over `.env` (dotenv default).
+ * - Never throws: configuration loading must not be able to crash startup.
+ */
+export function loadWorkspaceEnvFile(workspaceRoot: string | undefined): void {
+  if (!workspaceRoot) {
+    return;
+  }
+  try {
+    dotenv.config({ path: path.join(workspaceRoot, '.env') });
+  } catch (err) {
+    console.error(`CodeSense: failed to load .env (${String(err)})`);
+  }
 }
 
 export function readAiConfig(): AiConfig {
