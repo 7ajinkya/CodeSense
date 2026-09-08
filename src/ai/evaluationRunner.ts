@@ -67,6 +67,26 @@ export const HARD45_CHECKIN_MESSAGE =
   'Take a quick breather, re-check your approach against the examples, and keep going. ' +
   "If you're stuck on something specific, reply here and we'll work through it together.";
 
+/**
+ * Phase A proactive-notification decision (pure, no vscode dependency).
+ *
+ * True only when a TRIGGER-driven evaluation (idle or hard45) produced a
+ * learner-facing intervention that is actually displayed: evaluated OK and
+ * the originating attempt is still current (`displayed`). Everything else
+ * stays silent: NONE/silent outcomes, reply conversational turns, manual
+ * check-ins, failures, skips, and stale results for ended attempts.
+ * Determined from existing evaluation/trigger metadata — never UI timing.
+ */
+export function shouldNotifyProactiveIntervention(
+  triggerKind: EvaluationTriggerKind,
+  outcome: EvaluationOutcome,
+): boolean {
+  if (triggerKind !== 'idle' && triggerKind !== 'hard45') {
+    return false;
+  }
+  return outcome.status === 'evaluated' && outcome.displayed;
+}
+
 function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeout = new Promise<never>((_, reject) => {

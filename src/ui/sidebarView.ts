@@ -10,6 +10,12 @@ import { ATTEMPT_STATES, AttemptState, canEndAttempt } from '../attempts/attempt
  * snapshot built from existing domain state and forwards button/select
  * actions to existing services via `SidebarActions`. No business logic,
  * no second source of truth, no AI.
+ *
+ * Phase A (AI UX): coach messages render as safe Markdown (see
+ * `ui/markdown.ts` for the host-side renderer and its tests). The webview
+ * embeds a mirrored zero-dependency renderer — the webview cannot import
+ * from `src/`, so keep the two implementations in sync. Only whitelisted
+ * tags are ever emitted; all model/learner text is HTML-escaped first.
  */
 
 // ---------------------------------------------------------------------------
@@ -33,10 +39,21 @@ export interface SidebarProblemInfo {
   attemptStartedAt: string;
 }
 
+export interface SidebarExchangeMessage {
+  role: 'coach' | 'learner';
+  text: string;
+}
+
 export interface SidebarAiState {
   status: 'idle' | 'evaluating' | 'unavailable' | 'error';
   /** Latest coach message for the visible attempt, if any. */
   message: string | null;
+  /**
+   * Recent conversation tail for the visible attempt (oldest first),
+   * including learner replies. Rendered when non-empty; the legacy
+   * single `message` above is the fallback.
+   */
+  exchange: SidebarExchangeMessage[];
   /** True while a problem attempt is active (replies need an attempt). */
   canReply: boolean;
 }
@@ -198,6 +215,26 @@ function renderHtml(): string {
   button { cursor: pointer; }
   button:disabled { cursor: default; opacity: 0.55; }
   label { display: block; margin: 8px 0 2px; font-weight: 600; }
+  .coach-msg { background: var(--vscode-editorWidget-background, transparent); border: 1px solid var(--vscode-input-border);
+    border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  .learner-msg { border-left: 3px solid var(--vscode-focusBorder); padding: 4px 0 4px 10px; margin: 8px 0; }
+  .coach-name { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin-bottom: 4px; }
+  .md p { margin: 6px 0; line-height: 1.45; }
+  .md p:first-child { margin-top: 0; }
+  .md p:last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3, .md h4 { margin: 8px 0 4px; line-height: 1.3; text-transform: none;
+    border: none; padding: 0; color: inherit; }
+  .md h1 { font-size: 1.15em; }
+  .md h2 { font-size: 1.05em; }
+  .md h3, .md h4 { font-size: 1em; }
+  .md ul, .md ol { margin: 6px 0; padding-left: 20px; }
+  .md li { margin: 2px 0; line-height: 1.45; }
+  .md code { font-family: var(--vscode-editor-font-family, monospace); font-size: 0.9em;
+    background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.15)); padding: 1px 4px; border-radius: 4px; }
+  .md pre.codeblock { background: var(--vscode-editor-background); border: 1px solid var(--vscode-input-border);
+    border-radius: 6px; padding: 0; overflow-x: auto; margin: 8px 0; }
+  .md pre.codeblock code { display: block; background: none; padding: 8px 10px; white-space: pre; }
+  .md .code-lang { font-size: 0.75em; color: var(--vscode-descriptionForeground); padding: 4px 10px 0; }
 </style>
 </head>
 <body>
@@ -208,9 +245,130 @@ function renderHtml(): string {
   const content = document.getElementById('content');
   let startedAt = null;
   let clockTimer = null;
+  let replySending = false;
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  // Phase A safe-Markdown mirror of src/ui/markdown.ts (webview cannot
+  // import from src/). Escape-first, code placeholders, block state
+  // machine, inline bold/italic/code. Whitelisted tags only.
+  function sanitizeLang(raw) {
+    var label = String(raw || '').trim().split(/\\s+/)[0] || '';
+    if (!label) { return ''; }
+    if (/^[A-Za-z0-9+#_.-]{1,24}$/.test(label)) { return label; }
+    return 'code';
+  }
+  function inlineMd(rawLine) {
+    // Inline code is extracted via split (no backtick literal needed in
+    // this template) so markup inside code stays literal. An unmatched
+    // trailing backtick stays literal text.
+    var spans = [];
+    var bt = String.fromCharCode(96);
+    var parts = String(rawLine).split(bt);
+    var text = parts[0];
+    var p = 1;
+    while (p < parts.length) {
+      if (p < parts.length - 1) {
+        if (parts[p].length > 0) {
+          spans.push(parts[p]);
+          text += 'CODESENSEMDINLINE' + (spans.length - 1) + 'CODESENSEMD';
+        } else {
+          text += bt + bt;
+        }
+        text += parts[p + 1];
+        p += 2;
+      } else {
+        text += bt + parts[p];
+        p += 1;
+      }
+    }
+    var out = esc(text);
+    out = out.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+    out = out.replace(/__(.+?)__/g, '<strong>$1</strong>');
+    out = out.replace(/\\*([^*\\n]+?)\\*/g, '<em>$1</em>');
+    out = out.replace(/(^|\\W)_([^_\\n]+?)_(?=\\W|$)/g, '$1<em>$2</em>');
+    for (var k = 0; k < spans.length; k++) {
+      out = out.split('CODESENSEMDINLINE' + k + 'CODESENSEMD').join('<code>' + esc(spans[k]) + '</code>');
+    }
+    return out;
+  }
+  function mdToHtml(input) {
+    if (!input || !String(input).trim()) { return ''; }
+    var rawLines = String(input).replace(/\\r\\n/g, '\\n').split('\\n');
+    var lines = [];
+    var blocks = [];
+    var inCode = false;
+    var lang = '';
+    var code = [];
+    function closeCode() {
+      blocks.push({ language: lang, code: code.join('\\n') });
+      lines.push({ kind: 'code', index: blocks.length - 1 });
+      inCode = false; lang = ''; code = [];
+    }
+    for (var r = 0; r < rawLines.length; r++) {
+      var line = rawLines[r];
+      var trimmed = line.trim();
+      if (!inCode && trimmed.indexOf('\`\`\`') === 0) {
+        inCode = true; lang = sanitizeLang(trimmed.slice(3)); code = [];
+        continue;
+      }
+      if (inCode && trimmed.indexOf('\`\`\`') === 0) { closeCode(); continue; }
+      if (inCode) { code.push(line); } else { lines.push({ kind: 'text', line: line }); }
+    }
+    if (inCode) { closeCode(); }
+    function codeHtml(block) {
+      var body = esc(block.code);
+      if (block.language) {
+        return '<pre class="codeblock"><div class="code-lang">' + esc(block.language) + '</div><code>' + body + '</code></pre>';
+      }
+      return '<pre class="codeblock"><code>' + body + '</code></pre>';
+    }
+    var html = [];
+    var i = 0;
+    while (i < lines.length) {
+      var seg = lines[i];
+      if (seg.kind === 'code') { html.push(codeHtml(blocks[seg.index])); i++; continue; }
+      var cur = seg.line;
+      if (!cur.trim()) { i++; continue; }
+      var t = cur.trim();
+      var hm = /^(#{1,6})\\s+(.+?)\\s*$/.exec(t);
+      if (hm) { html.push('<h' + hm[1].length + '>' + inlineMd(hm[2]) + '</h' + hm[1].length + '>'); i++; continue; }
+      if (/^\\s*[-*+]\\s+.+$/.test(cur)) {
+        var items = [];
+        while (i < lines.length && lines[i].kind === 'text' && /^\\s*[-*+]\\s+.+$/.test(lines[i].line)) {
+          items.push('<li>' + inlineMd(lines[i].line.replace(/^\\s*[-*+]\\s+/, '')) + '</li>');
+          i++;
+        }
+        html.push('<ul>' + items.join('') + '</ul>');
+        continue;
+      }
+      if (/^\\s*\\d+\\.\\s+.+$/.test(cur)) {
+        var ordered = [];
+        while (i < lines.length && lines[i].kind === 'text' && /^\\s*\\d+\\.\\s+.+$/.test(lines[i].line)) {
+          ordered.push('<li>' + inlineMd(lines[i].line.replace(/^\\s*\\d+\\.\\s+/, '')) + '</li>');
+          i++;
+        }
+        html.push('<ol>' + ordered.join('') + '</ol>');
+        continue;
+      }
+      var para = [];
+      while (i < lines.length) {
+        var pl = lines[i];
+        if (pl.kind !== 'text') { break; }
+        if (!pl.line.trim()) { break; }
+        var pt = pl.line.trim();
+        if (/^(#{1,6})\\s+.+?\\s*$/.test(pt)) { break; }
+        if (/^\\s*[-*+]\\s+.+$/.test(pl.line) || /^\\s*\\d+\\.\\s+.+$/.test(pl.line)) { break; }
+        para.push(inlineMd(pl.line.trim()));
+        i++;
+      }
+      if (para.length) { html.push('<p>' + para.join('<br>') + '</p>'); }
+    }
+    return html.join('');
+  }
+  function learnerHtml(text) {
+    return '<p>' + esc(String(text).replace(/\\r\\n/g, '\\n')).split('\\n').join('<br>') + '</p>';
   }
   function fmtElapsed(ms) {
     const total = Math.max(0, Math.floor(ms / 1000));
@@ -237,12 +395,21 @@ function renderHtml(): string {
     if (status) {
       html += '<div class="row muted">' + esc(status) + '</div>';
     }
-    if (ai.message) {
-      html += '<div class="row"><span class="muted">\\u{1F916} CodeSense:</span><br>' + esc(ai.message) + '</div>';
+    if (ai.exchange.length > 0) {
+      html += ai.exchange
+        .map((turn) =>
+          turn.role === 'coach'
+            ? '<div class="coach-msg"><div class="coach-name">\\u{1F916} CodeSense</div><div class="md">' + mdToHtml(turn.text) + '</div></div>'
+            : '<div class="learner-msg"><div class="coach-name">You</div><div class="md">' + learnerHtml(turn.text) + '</div></div>',
+        )
+        .join('');
+    } else if (ai.message) {
+      html += '<div class="coach-msg"><div class="coach-name">\\u{1F916} CodeSense</div><div class="md">' + mdToHtml(ai.message) + '</div></div>';
     }
     if (ai.canReply) {
+      const replyDisabled = replySending || ai.status === 'evaluating' ? ' disabled' : '';
       html += '<div class="row"><textarea id="aiReply" rows="2" style="width:100%;box-sizing:border-box" placeholder="Reply to your coach…"></textarea></div>' +
-        '<div class="row"><button id="btnReply">Reply</button></div>';
+        '<div class="row"><button id="btnReply"' + replyDisabled + '>Reply</button></div>';
     }
     return html;
   }
@@ -315,7 +482,11 @@ function renderHtml(): string {
     const box = document.getElementById('aiReply');
     const btn = document.getElementById('btnReply');
     if (!box || !btn) { return; }
+    if (replySending) { btn.disabled = true; }
     btn.addEventListener('click', () => {
+      if (replySending) { return; }
+      replySending = true;
+      btn.disabled = true;
       vscode.postMessage({ command: 'aiReply', text: box.value });
       box.value = '';
     });
@@ -323,6 +494,9 @@ function renderHtml(): string {
   window.addEventListener('message', (event) => {
     const msg = event.data;
     if (msg && msg.command === 'snapshot') {
+      // Each snapshot is fresh server state: re-arm the Reply button.
+      // (Host-side evaluationInFlight remains the authoritative guard.)
+      replySending = false;
       render(msg.snapshot);
     }
   });

@@ -43,6 +43,7 @@ import {
   createTriggerState,
   pollTriggers,
   recordTriggerActivity,
+  resolveIdleThresholdMs,
 } from './triggers/triggerEngine';
 import {
   CheckpointReason,
@@ -64,8 +65,10 @@ import {
 import { EvaluationTriggerKind, generateConversationMessageId } from './ai/aiTypes';
 import { HttpChatReasoner } from './ai/reasoners';
 import { LocalAiStore } from './ai/aiStore';
-import { loadWorkspaceEnvFile, readAiConfig } from './ai/aiConfig';
-import { EvaluationOutcome, runAiEvaluation } from './ai/evaluationRunner';
+import { loadEnvFile, readAiConfig } from './ai/aiConfig';
+import { EvaluationOutcome, runAiEvaluation, shouldNotifyProactiveIntervention } from './ai/evaluationRunner';
+import { isAwaitingLearnerResponse } from './ai/conversationStatus';
+import { releaseEvaluation, tryReserveEvaluation } from './ai/evaluationGuard';
 import { buildAIContext } from './context/aiContext';
 import { editRecordsFromEvents, selectAttemptEdits } from './history/codeHistory';
 
@@ -108,6 +111,12 @@ import { editRecordsFromEvents, selectAttemptEdits } from './history/codeHistory
  *   evaluation per trigger instance (evaluation ≠ intervention; the model
  *   may legitimately decide no action is needed). Unconfigured or failing
  *   AI never affects telemetry, lifecycle, or the sidebar.
+ * - Phase A (AI UX, presentation only): the sidebar renders coach messages
+ *   as safe Markdown and learner messages as plain text; a non-modal info
+ *   nudge fires only for displayed idle/hard45 interventions; an idle
+ *   evaluation is suppressed while a coach question awaits the learner's
+ *   reply (hard45 never suppressed). Triggers, AI contract, and persistence
+ *   semantics are unchanged.
  */
 
 // ---------------------------------------------------------------------------
@@ -145,8 +154,13 @@ interface AiPanelState {
   status: 'idle' | 'evaluating' | 'unavailable' | 'error';
   lastMessage: string | null;
   lastAttemptId: string | null;
+  /** Recent conversation tail for lastAttemptId (oldest first). */
+  exchange: Array<{ role: 'coach' | 'learner'; text: string }>;
 }
-let aiPanel: AiPanelState = { status: 'idle', lastMessage: null, lastAttemptId: null };
+let aiPanel: AiPanelState = { status: 'idle', lastMessage: null, lastAttemptId: null, exchange: [] };
+
+/** Sidebar conversation tail length; the store keeps far more for prompts. */
+const AI_SIDEBAR_EXCHANGE_TAIL = 6;
 
 const TRIGGER_POLL_MS = 30 * 1000;
 
@@ -248,12 +262,12 @@ function updateSidebar(): void {
     // Never show another attempt's message here: the panel model is keyed
     // to the visible attempt (stale-evaluation protection, UI side).
     const visibleAttemptId = hasActiveProblem && activeAttempt ? activeAttempt.attemptId : null;
+    const forVisibleAttempt =
+      aiPanel.lastAttemptId !== null && aiPanel.lastAttemptId === visibleAttemptId;
     snapshot.ai = {
       status: aiPanel.status,
-      message:
-        aiPanel.lastAttemptId !== null && aiPanel.lastAttemptId === visibleAttemptId
-          ? aiPanel.lastMessage
-          : null,
+      message: forVisibleAttempt ? aiPanel.lastMessage : null,
+      exchange: forVisibleAttempt ? aiPanel.exchange : [],
       canReply: hasActiveProblem,
     };
   }
@@ -787,11 +801,20 @@ async function checkTriggers(): Promise<void> {
   if (!session || !attempt || !trigger) {
     return;
   }
-  const evaluation = pollTriggers(trigger, Date.now());
+  const evaluation = pollTriggers(trigger, Date.now(), resolveIdleThresholdMs());
   if (!evaluation.eligible || evaluation.kind === null) {
     return;
   }
   if (evaluation.kind === 'idle') {
+    // Phase A idle suppression: when the latest CodeSense intervention is a
+    // question still awaiting the learner's reply, do not stack another idle
+    // evaluation on top of it. The trigger epoch stays consumed (no refire);
+    // the learner's reply drives the next turn. Fail-open: store errors must
+    // never block evaluations. hard45 is NEVER suppressed (else branch).
+    if (await hasUnresolvedCoachQuestion(attempt.attemptId)) {
+      console.log('CodeSense: idle evaluation suppressed — awaiting learner reply to the coach.');
+      return;
+    }
     await createSnapshotCheckpoint('idle');
     recordEvent(session, 'attempt.triggerEligible', 'session', {
       attemptId: attempt.attemptId,
@@ -831,10 +854,11 @@ async function maybeRunAiEvaluation(
   attempt: Attempt,
   kind: EvaluationTriggerKind,
   reason: string,
+  preReserved = false,
 ): Promise<void> {
   const config = readAiConfig();
   if (!config.enabled) {
-    aiPanel = { status: 'unavailable', lastMessage: null, lastAttemptId: null };
+    aiPanel = { status: 'unavailable', lastMessage: null, lastAttemptId: null, exchange: [] };
     updateSidebar();
     if (!aiUnavailableNoticed) {
       aiUnavailableNoticed = true;
@@ -851,15 +875,22 @@ async function maybeRunAiEvaluation(
   if (!session || !problem || !live || live.attemptId !== attempt.attemptId) {
     return;
   }
-  if (evaluationInFlight.has(attempt.attemptId)) {
-    return;
+  // With preReserved, the caller already holds this attempt's reservation
+  // (added synchronously to close the back-to-back race); skipping the
+  // duplicate check here is what lets the reserved evaluation proceed.
+  if (!preReserved) {
+    if (!tryReserveEvaluation(evaluationInFlight, attempt.attemptId)) {
+      return;
+    }
   }
-  evaluationInFlight.add(attempt.attemptId);
   try {
     aiPanel = {
       status: 'evaluating',
       lastMessage: aiPanel.lastAttemptId === attempt.attemptId ? aiPanel.lastMessage : null,
       lastAttemptId: attempt.attemptId,
+      // Mirror the message rule: a new attempt starts with no visible
+      // exchange until its own conversation is (re)loaded below.
+      exchange: aiPanel.lastAttemptId === attempt.attemptId ? aiPanel.exchange : [],
     };
     updateSidebar();
     const outcome: EvaluationOutcome = await runAiEvaluation(
@@ -888,23 +919,39 @@ async function maybeRunAiEvaluation(
         interventionType: evaluation.interventionType,
       });
       if (outcome.displayed) {
-        aiPanel = { status: 'idle', lastMessage: evaluation.message, lastAttemptId: evaluation.attemptId };
+        aiPanel = { status: 'idle', lastMessage: evaluation.message, lastAttemptId: evaluation.attemptId, exchange: aiPanel.exchange };
       } else {
         // Evaluated fine, but the learner moved on: persist (done above),
         // never display inside the new attempt. Panel keeps prior state.
-        aiPanel = { status: 'idle', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId };
+        aiPanel = { status: 'idle', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
+      }
+      // Phase A proactive notification: a subtle native nudge ONLY when a
+      // trigger-driven (idle/hard45) evaluation produced a learner-facing
+      // intervention on the still-current attempt. Reply turns, manual
+      // check-ins, NONE/silent outcomes, failures, and stale results stay
+      // silent (see shouldNotifyProactiveIntervention).
+      if (shouldNotifyProactiveIntervention(kind, outcome)) {
+        void vscode.window.showInformationMessage(
+          'CodeSense: your coach left a new message — see the AI Coach panel in the sidebar.',
+        );
       }
     } else if (outcome.status === 'failed') {
       console.error(`CodeSense: AI evaluation failed (${outcome.reason}): ${outcome.detail}`);
-      aiPanel = { status: 'error', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId };
-      if (kind === 'manual') {
+      aiPanel = { status: 'error', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
+      if (kind === 'manual' || kind === 'reply') {
+        // User-initiated requests get a visible failure notice (triggered
+        // evaluations stay panel-only to avoid nagging); the learner's
+        // already-submitted reply is untouched in the store.
         void vscode.window.showWarningMessage(
           `CodeSense AI check-in failed (${outcome.reason}). Telemetry is unaffected; retry any time.`,
         );
       }
     }
+    // Re-render the exchange so an assistant response appears as soon as it
+    // is persisted (no-op when nothing new was appended).
+    await refreshAiExchange(attempt.attemptId);
   } finally {
-    evaluationInFlight.delete(attempt.attemptId);
+    releaseEvaluation(evaluationInFlight, attempt.attemptId);
     updateSidebar();
   }
 }
@@ -947,8 +994,52 @@ function requestManualEvaluation(): void {
   void maybeRunAiEvaluation(attempt, 'manual', 'manual check-in requested from the command palette');
 }
 
-/** Learner reply from the sidebar: persisted conversation, no auto-evaluation. */
-function handleAiReply(rawText: string): void {
+/**
+ * Phase A idle suppression probe: true when the attempt's latest CodeSense
+ * intervention is a question still awaiting the learner's reply (existing
+ * conversation + evaluation state only). Fail-open — store errors allow the
+ * evaluation so suppression can never silence the coach by accident.
+ */
+async function hasUnresolvedCoachQuestion(attemptId: string): Promise<boolean> {
+  try {
+    const [conversation, evaluations] = await Promise.all([
+      activeAiStore().listConversation(attemptId),
+      activeAiStore().listEvaluationsForAttempt(attemptId),
+    ]);
+    return isAwaitingLearnerResponse(conversation, evaluations);
+  } catch (err) {
+    console.error('CodeSense: failed to check conversation state; allowing idle evaluation', err);
+    return false;
+  }
+}
+
+/**
+ * Reload the sidebar conversation tail for one attempt and re-render.
+ * Skipped silently when the attempt is no longer active (endProblem and
+ * deactivate already refresh the sidebar for their own transitions).
+ */
+async function refreshAiExchange(attemptId: string): Promise<void> {
+  if (activeAttempt?.attemptId !== attemptId) {
+    return;
+  }
+  try {
+    const all = await activeAiStore().listConversation(attemptId);
+    aiPanel.lastAttemptId = attemptId;
+    aiPanel.exchange = all
+      .slice(-AI_SIDEBAR_EXCHANGE_TAIL)
+      .map((m) => ({ role: m.role, text: m.text }));
+  } catch (err) {
+    console.error('CodeSense: failed to refresh AI conversation', err);
+    return;
+  }
+  updateSidebar();
+}
+
+/** Learner reply from the sidebar: persist, render immediately, then run one
+ * conversational evaluation turn (kind 'reply' — never a fake trigger).
+ * A reply that arrives while a response is already in flight is still
+ * persisted and rendered, but starts no duplicate evaluation. */
+async function handleAiReply(rawText: string): Promise<void> {
   const text = rawText.trim();
   if (text.length === 0) {
     return;
@@ -958,21 +1049,36 @@ function handleAiReply(rawText: string): void {
     void vscode.window.showInformationMessage('CodeSense: no active problem to reply about.');
     return;
   }
-  const capped = text.length > 2000 ? text.slice(0, 2000) : text;
-  void activeAiStore()
-    .appendConversation({
+  // Synchronous reservation: back-to-back Replies persist every message but
+  // start exactly one conversational evaluation (released by the runner).
+  const alreadyRunning = !tryReserveEvaluation(evaluationInFlight, attempt.attemptId);
+  try {
+    await activeAiStore().appendConversation({
       messageId: generateConversationMessageId(),
       attemptId: attempt.attemptId,
       timestamp: new Date().toISOString(),
       role: 'learner',
-      text: capped,
-    })
-    .then(
-      () => updateSidebar(),
-      (err: unknown) => {
-        console.error('CodeSense: failed to persist learner reply', err);
-      },
-    );
+      text: text.length > 2000 ? text.slice(0, 2000) : text,
+    });
+  } catch (err) {
+    console.error('CodeSense: failed to persist learner reply', err);
+    if (!alreadyRunning) {
+      releaseEvaluation(evaluationInFlight, attempt.attemptId);
+    }
+    return;
+  }
+  // Render the learner message immediately, before the model responds.
+  await refreshAiExchange(attempt.attemptId);
+  if (!alreadyRunning) {
+    try {
+      await maybeRunAiEvaluation(attempt, 'reply', 'learner reply in sidebar conversation', true);
+    } finally {
+      // Release our reservation even on paths where the runner returns
+      // before its own try/finally (unconfigured AI, ended attempt).
+      // Delete is idempotent with the runner's own release.
+      releaseEvaluation(evaluationInFlight, attempt.attemptId);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,10 +1177,12 @@ function showSessionDataLocation(): void {
 
 export function activate(context: vscode.ExtensionContext): void {
   console.log('CodeSense extension activated');
-  // Project-local AI configuration: <workspace-root>/.env is loaded into
-  // process.env before anything reads it. No workspace or no .env is a
-  // silent no-op; explicit environment variables keep working as before.
-  loadWorkspaceEnvFile(workspaceFsPath());
+  // AI configuration travels with the extension, not the learner workspace:
+  // `<extension-path>/.env` is loaded into process.env before anything
+  // reads it, so CodeSense works from arbitrary workspace folders. Missing
+  // path or missing .env is a silent no-op; explicit environment variables
+  // keep working as before. Session data still lives in the workspace.
+  loadEnvFile(context.extensionPath);
   rebindStores();
   statusBar = new CodeSenseStatusBar();
   refreshStatusBar();
@@ -1104,7 +1212,7 @@ export function activate(context: vscode.ExtensionContext): void {
       void showProblemHistory();
     },
     aiReply: (text: string) => {
-      handleAiReply(text);
+      void handleAiReply(text);
     },
   });
   const sidebarDisposable = vscode.window.registerWebviewViewProvider(
