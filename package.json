@@ -21,6 +21,8 @@
     "onCommand:codesense.showTimeline",
     "onCommand:codesense.showSessionDataLocation",
     "onCommand:codesense.evaluateNow",
+    "onCommand:codesense.reviewLearningGoals",
+    "onCommand:codesense.suggestNextActivity",
     "onView:codesense.sidebar"
   ],
   "main": "./out/extension.js",
@@ -71,6 +73,14 @@
       {
         "command": "codesense.evaluateNow",
         "title": "CodeSense: Request AI Check-in Now"
+      },
+      {
+        "command": "codesense.reviewLearningGoals",
+        "title": "CodeSense: Review Learning Goals"
+      },
+      {
+        "command": "codesense.suggestNextActivity",
+        "title": "CodeSense: Suggest Next Practice Activity"
       },
       {
         "command": "codesense.showMenu",

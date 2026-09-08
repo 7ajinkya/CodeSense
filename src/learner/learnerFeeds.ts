@@ -1,9 +1,11 @@
 import type { AIEvaluation, AIConversationMessage, InterventionType } from '../ai/aiTypes';
 import type { Attempt, AttemptState } from '../attempts/attempt';
+import { hashIdentity } from '../problems/problem';
 import type { Problem } from '../problems/problem';
 import type { ProblemClassification } from '../knowledge/classification';
 import type { KnowledgeGraph } from '../knowledge/ontologyStore';
 import {
+  EVIDENCE_SCHEMA_VERSION,
   EvidenceConfidence,
   EvidenceDimension,
   EvidenceType,
@@ -203,6 +205,37 @@ function helpConfidence(level: HelpLevel): EvidenceConfidence {
 }
 
 /**
+ * Stable identity for attempt-derived evidence (duplicate-sync fix).
+ *
+ * The same finalized attempt synchronized twice must yield the same
+ * records, so the evidence store's ID dedup collapses repeat passes
+ * instead of persisting duplicate copies. Coordinates cover everything
+ * that distinguishes legitimate facets of one attempt (schema, attempt,
+ * problem, type, entities, help level); timestamps are deliberately
+ * excluded so re-finalization clock skew can never fork identities, and
+ * so the ID never depends on wall-clock time for finalized attempts.
+ * Different attempts always differ by attemptId; genuinely different
+ * observations (e.g. a newly observed help level) keep distinct IDs.
+ */
+function stableAttemptEvidenceId(args: {
+  attemptId: string;
+  problemId: string;
+  evidenceType: EvidenceType;
+  entityIds: string[];
+  helpLevel?: HelpLevel;
+}): string {
+  const key = [
+    EVIDENCE_SCHEMA_VERSION,
+    args.attemptId,
+    args.problemId,
+    args.evidenceType,
+    [...args.entityIds].sort().join(','),
+    args.helpLevel ?? '',
+  ].join('|');
+  return `ev_${hashIdentity(key)}`;
+}
+
+/**
  * Attempt-completion feed. Emits EXPOSURE (all classified entities) plus
  * outcome evidence scoped to approach-level buckets. Returns [] when the
  * problem is unclassified — without classification there is no honest
@@ -234,6 +267,16 @@ export function extractAttemptEvidence(
     return [];
   }
   const scoped = classifiedEntities(args.classification, OUTCOME_BUCKETS);
+  // Stable per-record identity: repeat synchronizations of the same
+  // finalized attempt mint the same IDs, so the store collapses them.
+  const stableId = (evidenceType: EvidenceType, entityIds: string[], helpLevel?: HelpLevel): string =>
+    stableAttemptEvidenceId({
+      attemptId: attempt.attemptId,
+      problemId: problem.problemId,
+      evidenceType,
+      entityIds,
+      helpLevel,
+    });
   const exposure = buildEvidence(
     graph,
     {
@@ -243,7 +286,7 @@ export function extractAttemptEvidence(
       interpretation: 'Encountered these knowledge areas. Exposure only — no ability claim follows.',
       confidence: 'high',
     },
-    ctx,
+    { ...ctx, evidenceId: stableId('EXPOSURE', exposed) },
   );
   if (exposure) {
     out.push(exposure);
@@ -265,7 +308,7 @@ export function extractAttemptEvidence(
         confidence: 'medium',
         helpLevel: 'none',
       },
-      ctx,
+      { ...ctx, evidenceId: stableId('INDEPENDENT_SUCCESS', scoped, 'none') },
     );
     const implemented = buildEvidence(
       graph,
@@ -276,7 +319,7 @@ export function extractAttemptEvidence(
         interpretation: 'The code ran to an accepted outcome once; approach choice and edge coverage stay unknown.',
         confidence: 'low',
       },
-      ctx,
+      { ...ctx, evidenceId: stableId('IMPLEMENTATION_SUCCESS', scoped) },
     );
     if (independent) {
       out.push(independent);
@@ -296,7 +339,7 @@ export function extractAttemptEvidence(
         interpretation: 'Eventual success with help in the loop; implementation credit is shared with the help received.',
         confidence: 'low',
       },
-      ctx,
+      { ...ctx, evidenceId: stableId('IMPLEMENTATION_SUCCESS', scoped) },
     );
     if (implemented) {
       out.push(implemented);
@@ -313,7 +356,7 @@ export function extractAttemptEvidence(
           'parsing, language friction, or pressure — none established by an outcome alone.',
         confidence: 'low',
       },
-      ctx,
+      { ...ctx, evidenceId: stableId('IMPLEMENTATION_FAILURE', scoped) },
     );
     if (failed) {
       out.push(failed);
@@ -330,7 +373,7 @@ export function extractAttemptEvidence(
         confidence: helpConfidence(maxHelp),
         helpLevel: maxHelp,
       },
-      ctx,
+      { ...ctx, evidenceId: stableId('HELP_REQUIRED', scoped, maxHelp) },
     );
     if (helped) {
       out.push(helped);
@@ -349,7 +392,7 @@ export function extractAttemptEvidence(
         confidence: 'low',
         helpLevel: 'unknown',
       },
-      ctx,
+      { ...ctx, evidenceId: stableId('HELP_REQUIRED', scoped, 'unknown') },
     );
     if (reported) {
       out.push(reported);

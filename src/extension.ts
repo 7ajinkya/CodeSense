@@ -86,6 +86,7 @@ import { HttpProblemClassificationReasoner, runProblemClassification } from './k
 // fail-open; they never block solving, coaching, or lifecycle transitions).
 import { LocalLearnerEvidenceStore } from './learner/learnerEvidenceStore';
 import { LocalLearnerModelStore } from './learner/learnerModelStore';
+import { isKnownEvidenceDimension } from './learner/learnerTypes';
 import { buildLearnerNotesForPrompt } from './learner/learnerQueries';
 import {
   syncAttemptToLearnerModel,
@@ -98,6 +99,39 @@ import {
 import { LocalAiTraceStore } from './ai/aiTrace';
 import { buildCoachContext, summarizeCoachingTurn } from './coach/coachContext';
 import type { CoachContext } from './coach/coachTypes';
+// Phase F1 imports (learning needs + learner-owned goals: deterministic
+// derivation from the frozen learner model, durable lifecycle-managed
+// goals, fail-open background surfacing; never a second mastery model,
+// never automatic activation without a learner decision).
+import { LocalGoalStore } from './goals/goalStore';
+import { detectLearningNeeds } from './goals/needDetection';
+import { explainProposal, proposeGoalFromNeed, proposeGoalFromRequest } from './goals/goalProposal';
+import { acceptGoal, modifyGoal, rejectGoal, resumeGoal, pauseGoal, completeGoal, abandonGoal } from './goals/goalLifecycle';
+import {
+  findConflictingGoal,
+  getActiveGoals,
+  getProposals,
+  proposalFingerprint,
+  shouldSuppressProposal,
+  summarizeGoalsForPrompt,
+} from './goals/goalQueries';
+import type { LearningGoal } from './goals/goalTypes';
+// Phase F2 imports (targeted practice planning: deterministic selection of
+// an existing problem serving an active goal, durable plan lifecycle,
+// fail-open learner-facing surfacing; never generates problems, never
+// models the learner, never writes D evidence or F1 goal state).
+import { LocalActivityPlanStore } from './practice/activityStore';
+import { buildPracticeCatalog, type ActivityCatalogEntry } from './practice/activityCatalog';
+import { planNextActivity } from './practice/activityPlanner';
+import { linkAttemptToPlan, offerPlan, startPlan } from './practice/activityLifecycle';
+import { getActivePlansForGoal, summarizePlanForLearner } from './practice/activityQueries';
+// Phase F3 imports (practice evidence feedback: goal-relative progress
+// over finalized D evidence, durable per-activity records, fail-open
+// background evaluation; never writes D evidence, never transitions
+// goals or plans, never plans the next activity).
+import { LocalProgressStore } from './progress/progressStore';
+import { evaluateActivityProgress } from './progress/progressEvaluation';
+import { summarizeProgressForLearner } from './progress/progressQueries';
 
 /**
  * Phase 0 activity capture: observe document / editor / diagnostics /
@@ -183,6 +217,17 @@ let classificationStore: LocalClassificationStore | null = null;
 // evidence file is the source of truth, never this cache.
 let learnerEvidenceStore: LocalLearnerEvidenceStore | null = null;
 let learnerModelStore: LocalLearnerModelStore | null = null;
+// Phase F1 state: durable learner-owned goals (proposals + active goals).
+// Same local-first store pattern; goals survive restart/session/problem.
+let goalStore: LocalGoalStore | null = null;
+// Phase F2 state: durable targeted-practice plans (one plan per suggested
+// activity, linked to its active goal). Same local-first store pattern;
+// plans survive restart/session/problem boundaries.
+let activityPlanStore: LocalActivityPlanStore | null = null;
+// Phase F3 state: durable goal-relative progress records (one per
+// evaluated activity, chronological per goal). Same local-first store
+// pattern; progress survives restart/session/problem boundaries.
+let progressStore: LocalProgressStore | null = null;
 // Phase E state: secret-free AI interaction trace ring (debug aid only,
 // never learner evidence, never uploaded anywhere).
 let aiTraceStore: LocalAiTraceStore | null = null;
@@ -270,6 +315,27 @@ function activeAiTraceStore(): LocalAiTraceStore {
   return aiTraceStore;
 }
 
+function activeGoalStore(): LocalGoalStore {
+  if (!goalStore) {
+    goalStore = new LocalGoalStore(workspaceFsPath());
+  }
+  return goalStore;
+}
+
+function activeActivityPlanStore(): LocalActivityPlanStore {
+  if (!activityPlanStore) {
+    activityPlanStore = new LocalActivityPlanStore(workspaceFsPath());
+  }
+  return activityPlanStore;
+}
+
+function activeProgressStore(): LocalProgressStore {
+  if (!progressStore) {
+    progressStore = new LocalProgressStore(workspaceFsPath());
+  }
+  return progressStore;
+}
+
 function rebindStores(): void {
   const wsPath = workspaceFsPath();
   store = new LocalSessionStore(wsPath);
@@ -281,6 +347,9 @@ function rebindStores(): void {
   learnerEvidenceStore = new LocalLearnerEvidenceStore(wsPath);
   learnerModelStore = new LocalLearnerModelStore(wsPath);
   aiTraceStore = new LocalAiTraceStore(wsPath);
+  goalStore = new LocalGoalStore(wsPath);
+  activityPlanStore = new LocalActivityPlanStore(wsPath);
+  progressStore = new LocalProgressStore(wsPath);
 }
 
 function getHistoryChannel(): vscode.OutputChannel {
@@ -601,6 +670,10 @@ async function handleProblemStart(input: StartInput): Promise<{ ok: true } | { o
   } catch (err) {
     return { ok: false, error: `Could not persist the attempt (${String(err)}).` };
   }
+  // Phase F2 seam: link the new attempt to any offered plan for this
+  // problem (background, fail-open — the attempt lifecycle above is
+  // already safe and stays authoritative).
+  void maybeLinkAttemptToPlan(attempt, problem);
   activeProblem = problem;
   activeAttempt = attempt;
   activeTrigger = createTriggerState(Date.parse(attempt.startedAt), Date.now());
@@ -751,9 +824,21 @@ async function endProblem(): Promise<Attempt | null> {
     attemptId: attempt.attemptId,
     finalState: attempt.currentState,
   });
-  // Phase D: feed the completed attempt to the learner model in the
-  // background. Fire-and-forget — history and lifecycle are already safe.
-  void maybeSyncAttemptToLearnerModel(attempt, problem);
+  // Phase D+F1+F3, one authoritative sync: the F1 chain below awaits the
+  // attempt→D synchronization before detection (attempt-evidence IDs are
+  // stable per attempt, so even overlapping passes cannot duplicate), and
+  // F3 follows it — one finalized attempt, one evidence synchronization.
+  // Phase F1: derive candidate needs from the fresh model and surface at
+  // most one proposal. Background and silent on every failure path; the
+  // learner activates nothing implicitly (see maybeProposeGoalAfterProblemEnd).
+  // Phase F3 chains after it (which awaits a D sync first), so progress
+  // evaluation reads finalized evidence without adding new D writes.
+  void maybeProposeGoalAfterProblemEnd(attempt, problem).then(
+    () => maybeEvaluateProgressAfterProblemEnd(attempt),
+    (err: unknown) => {
+      console.error('CodeSense: background goal chain failed', err);
+    },
+  );
   // Ending a problem resets the trigger lifecycle (§32): drop per-attempt state.
   activeAttempt = null;
   activeProblem = null;
@@ -838,6 +923,8 @@ async function showMenu(): Promise<void> {
     }
   }
   choices.push({ label: '$(history) Show Problem History', action: 'history' });
+  choices.push({ label: '$(target) Review Learning Goals', action: 'goals' });
+  choices.push({ label: '$(zap) Suggest Next Practice Activity', action: 'practice' });
   choices.push({ label: '$(list-unordered) Show Session Timeline', action: 'timeline' });
   choices.push({ label: '$(file) Show Session Data Location', action: 'location' });
   const picked = await vscode.window.showQuickPick(choices, { placeHolder: 'CodeSense' });
@@ -862,6 +949,12 @@ async function showMenu(): Promise<void> {
       break;
     case 'history':
       void showProblemHistory();
+      break;
+    case 'goals':
+      void reviewLearningGoals();
+      break;
+    case 'practice':
+      void suggestNextActivityFlow();
       break;
     case 'timeline':
       void showTimeline();
@@ -1267,6 +1360,580 @@ async function maybeSyncEvaluationToLearnerModel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase F1: learning needs + learner-owned goals (background, fail-open)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs the End Problem goal chain in the background: await the attempt
+ * sync so detection reads the fresh profile, derive candidate needs,
+ * persist the first non-conflicting, non-suppressed proposal, and surface
+ * it once. Never throws; every failure degrades to silence.
+ */
+async function maybeProposeGoalAfterProblemEnd(attempt: Attempt, problem: Problem): Promise<void> {
+  try {
+    await maybeSyncAttemptToLearnerModel(attempt, problem);
+    const [profile, goals] = await Promise.all([
+      activeLearnerModelStore().loadProfile().catch(() => null),
+      activeGoalStore().listGoals().catch(() => []),
+    ]);
+    if (!profile) {
+      return;
+    }
+    if (goals.some((g) => g.status === 'proposed')) {
+      return;
+    }
+    const now = new Date().toISOString();
+    const needs = detectLearningNeeds({ profile, graph: getDefaultKnowledgeGraph(), now, limit: 3 });
+    for (const need of needs) {
+      const proposal = proposeGoalFromNeed(need, { graph: getDefaultKnowledgeGraph(), now });
+      if (!proposal) {
+        continue;
+      }
+      if (findConflictingGoal(goals, proposal.targetKey)) {
+        continue;
+      }
+      const fingerprint = proposalFingerprint(proposal.evidenceBasis.evidenceIds, profile.updatedAt);
+      if (shouldSuppressProposal(goals, proposal.targetKey, fingerprint)) {
+        continue;
+      }
+      await activeGoalStore().upsertGoal(proposal);
+      void surfaceGoalProposal(proposal.goalId);
+      return;
+    }
+  } catch (err) {
+    console.error('CodeSense: background goal proposal failed', err);
+  }
+}
+
+/** Present one pending proposal with Accept / Modify / Not-now actions. */
+async function surfaceGoalProposal(goalId: string): Promise<void> {
+  try {
+    const store = activeGoalStore();
+    const proposal = await store.getGoal(goalId).catch(() => null);
+    if (!proposal || proposal.status !== 'proposed') {
+      return;
+    }
+    const graph = getDefaultKnowledgeGraph();
+    const profile = await activeLearnerModelStore().loadProfile().catch(() => null);
+    const evidence = await activeLearnerEvidenceStore().listEvidence().catch(() => []);
+    let detail = proposal.description;
+    if (profile) {
+      const need = detectLearningNeeds({ profile, graph, now: new Date().toISOString(), limit: 10 }).find(
+        (candidate) => candidate.needId === proposal.evidenceBasis.needId,
+      );
+      if (need) {
+        const explanation = explainProposal(need, evidence, graph);
+        detail = `${proposal.description}\n${explanation.summary}`;
+        if (explanation.uncertainty) {
+          detail += `\n${explanation.uncertainty}`;
+        }
+      }
+    }
+    const pick = await vscode.window.showInformationMessage(
+      `CodeSense learning goal suggestion:\n${detail}`,
+      'Start goal',
+      'Modify…',
+      'Not now',
+    );
+    if (pick === 'Start goal') {
+      await decideGoal(proposal.goalId, 'accept');
+    } else if (pick === 'Modify…') {
+      const text = await vscode.window.showInputBox({
+        prompt: 'Adjust the goal description (evidence basis is kept)',
+        value: proposal.description,
+        validateInput: (value) =>
+          value.trim().length > 0 ? null : 'Describe the goal in a few words.',
+      });
+      if (text !== undefined) {
+        await decideGoal(proposal.goalId, 'modify', text);
+      }
+    } else if (pick === 'Not now') {
+      await decideGoal(proposal.goalId, 'reject');
+    }
+  } catch (err) {
+    console.error('CodeSense: failed to surface goal proposal', err);
+  }
+}
+
+/** Apply one learner decision to a proposed goal (accept/modify/reject). */
+async function decideGoal(goalId: string, decision: 'accept' | 'modify' | 'reject', text?: string): Promise<void> {
+  try {
+    const store = activeGoalStore();
+    const proposal = await store.getGoal(goalId).catch(() => null);
+    if (!proposal || proposal.status !== 'proposed') {
+      return;
+    }
+    const now = new Date().toISOString();
+    if (decision === 'accept') {
+      const profile = await activeLearnerModelStore().loadProfile().catch(() => null);
+      if (!profile) {
+        return;
+      }
+      await store.upsertGoal(acceptGoal(proposal, { profile, now }));
+      void vscode.window.showInformationMessage(`CodeSense: goal active — "${proposal.description}"`);
+    } else if (decision === 'modify') {
+      const profile = await activeLearnerModelStore().loadProfile().catch(() => null);
+      if (!profile || text === undefined) {
+        return;
+      }
+      await store.upsertGoal(
+        modifyGoal(proposal, { description: text, learnerStatement: text }, { profile, now }),
+      );
+      void vscode.window.showInformationMessage(`CodeSense: goal active — "${text.trim()}"`);
+    } else {
+      const profile = await activeLearnerModelStore().loadProfile().catch(() => null);
+      await store.upsertGoal(
+        rejectGoal(proposal, { profileUpdatedAt: profile?.updatedAt ?? now, now }),
+      );
+    }
+  } catch (err) {
+    console.error('CodeSense: failed to record goal decision', err);
+  }
+}
+
+/** Review surface: active goals + pending proposals + learner-created goals. */
+async function reviewLearningGoals(): Promise<void> {
+  try {
+    const store = activeGoalStore();
+    const goals = await store.listGoals().catch(() => []);
+    interface GoalChoice extends vscode.QuickPickItem {
+      action: string;
+      goalId?: string;
+    }
+    const choices: GoalChoice[] = [];
+    for (const goal of goals.filter((g) => g.status === 'active' || g.status === 'paused')) {
+      choices.push({
+        label: `$(${goal.status === 'active' ? 'target' : 'debug-pause'}) ${goal.description}`,
+        description: `${goal.dimension} · ${goal.source === 'learner-requested' ? 'my goal' : 'from evidence'}`,
+        action: 'inspect',
+        goalId: goal.goalId,
+      });
+    }
+    for (const goal of goals.filter((g) => g.status === 'proposed')) {
+      choices.push({
+        label: `$(question) Proposed: ${goal.description}`,
+        description: 'awaiting your decision',
+        action: 'decide',
+        goalId: goal.goalId,
+      });
+    }
+    choices.push({ label: '$(plus) Set a new goal…', action: 'create' });
+    const picked = await vscode.window.showQuickPick(choices, { placeHolder: 'CodeSense learning goals' });
+    if (!picked) {
+      return;
+    }
+    if (picked.action === 'create') {
+      void createLearnerGoalFlow();
+      return;
+    }
+    if (!picked.goalId) {
+      return;
+    }
+    const goal = await store.getGoal(picked.goalId).catch(() => null);
+    if (!goal) {
+      return;
+    }
+    if (picked.action === 'decide') {
+      void surfaceGoalProposal(goal.goalId);
+      return;
+    }
+    await inspectGoal(goal);
+  } catch (err) {
+    console.error('CodeSense: failed to review learning goals', err);
+  }
+}
+
+async function inspectGoal(goal: LearningGoal): Promise<void> {
+  interface GoalActionChoice extends vscode.QuickPickItem {
+    action: string;
+  }
+  const choices: GoalActionChoice[] = [];
+  if (goal.status === 'active') {
+    choices.push({ label: 'Suggest next activity', action: 'practice' });
+    choices.push({ label: 'Pause goal', action: 'pause' });
+    choices.push({ label: 'Mark achieved', action: 'achieve' });
+    choices.push({ label: 'Abandon goal', action: 'abandon' });
+  } else if (goal.status === 'paused') {
+    choices.push({ label: 'Resume goal', action: 'resume' });
+    choices.push({ label: 'Abandon goal', action: 'abandon' });
+  } else {
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(choices, { placeHolder: goal.description });
+  if (!picked) {
+    return;
+  }
+  if (picked.action === 'practice') {
+    void suggestNextActivityFlow(goal.goalId);
+    return;
+  }
+  try {
+    const store = activeGoalStore();
+    const now = new Date().toISOString();
+    const current = await store.getGoal(goal.goalId).catch(() => null);
+    if (!current || (current.status !== 'active' && current.status !== 'paused')) {
+      return;
+    }
+    if (picked.action === 'pause') {
+      await store.upsertGoal(pauseGoal(current, now));
+    } else if (picked.action === 'resume') {
+      await store.upsertGoal(resumeGoal(current, now));
+    } else if (picked.action === 'achieve') {
+      await store.upsertGoal(completeGoal(current, now));
+    } else if (picked.action === 'abandon') {
+      await store.upsertGoal(abandonGoal(current, now));
+    }
+    void vscode.window.showInformationMessage(`CodeSense: goal updated (${picked.action}).`);
+  } catch (err) {
+    console.error('CodeSense: failed to update learning goal', err);
+  }
+}
+
+/** Guided creation of a learner-requested goal (explicit intent, no evidence needed). */
+async function createLearnerGoalFlow(): Promise<void> {
+  try {
+    const description = await vscode.window.showInputBox({
+      prompt: 'What do you want to get better at? (e.g. "DP on grids")',
+      validateInput: (value) => (value.trim().length > 0 ? null : 'Describe the goal in a few words.'),
+    });
+    if (description === undefined || description.trim().length === 0) {
+      return;
+    }
+    const dimensions = [
+      'recognition',
+      'conceptual',
+      'implementation',
+      'debugging',
+      'transfer',
+      'independence',
+    ] as const;
+    const pickedDimension = await vscode.window.showQuickPick([...dimensions], {
+      placeHolder: 'Which kind of capability is this about?',
+    });
+    if (pickedDimension === undefined || !isKnownEvidenceDimension(pickedDimension)) {
+      return;
+    }
+    const entityInput = await vscode.window.showInputBox({
+      prompt: 'Related topic, concept, or technique (optional — e.g. "dynamic programming")',
+    });
+    const graph = getDefaultKnowledgeGraph();
+    let entityIds: string[] = [];
+    if (entityInput !== undefined && entityInput.trim().length > 0) {
+      const resolved = graph.findByAlias(entityInput.trim()) ?? graph.findByName(entityInput.trim());
+      if (resolved) {
+        entityIds = [resolved.id];
+      }
+    }
+    const profile = await activeLearnerModelStore().loadProfile().catch(() => null);
+    const now = new Date().toISOString();
+    const draft = proposeGoalFromRequest(
+      { entityIds, dimension: pickedDimension, learnerStatement: description.trim() },
+      { graph, profile, now },
+    );
+    if (!draft) {
+      return;
+    }
+    if (findConflictingGoal(await activeGoalStore().listGoals().catch(() => []), draft.targetKey)) {
+      void vscode.window.showInformationMessage('CodeSense: you already have a goal covering that target.');
+      return;
+    }
+    // Explicit creation IS the learner decision: activate immediately with
+    // a baseline, preserving the request as provenance.
+    const store = activeGoalStore();
+    await store.upsertGoal(draft);
+    const saved = await store.getGoal(draft.goalId).catch(() => null);
+    if (saved && profile) {
+      await store.upsertGoal(acceptGoal(saved, { profile, now, note: 'created directly by learner' }));
+    }
+    void vscode.window.showInformationMessage(`CodeSense: goal active — "${draft.description}"`);
+  } catch (err) {
+    console.error('CodeSense: failed to create learning goal', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase F2: targeted practice suggestions (background, fail-open)
+// ---------------------------------------------------------------------------
+
+/** Build the F2 catalog from stored problems + their classifications. */
+async function loadPracticeCatalog(): Promise<ActivityCatalogEntry[]> {
+  try {
+    const problems = await activeProblemStore().listProblems().catch(() => []);
+    const resolved = await Promise.all(
+      problems.map(async (problem) => {
+        const stored = await activeClassificationStore()
+          .getClassification(problem.problemId)
+          .catch(() => null);
+        return { problem, classification: problem.classification ?? stored };
+      }),
+    );
+    return buildPracticeCatalog(
+      resolved.map((entry) => entry.problem),
+      resolved.map((entry) => entry.classification),
+    );
+  } catch (err) {
+    console.error('CodeSense: failed to load practice catalog', err);
+    return [];
+  }
+}
+
+/** All attempts across known problems (bounded by problem count). */
+async function loadAllAttempts(): Promise<Attempt[]> {
+  try {
+    const problems = await activeProblemStore().listProblems().catch(() => []);
+    const perProblem = await Promise.all(
+      problems.map((problem) =>
+        activeAttemptStore().listAttemptsForProblem(problem.problemId).catch(() => []),
+      ),
+    );
+    return perProblem.flat();
+  } catch (err) {
+    console.error('CodeSense: failed to load attempts for practice planning', err);
+    return [];
+  }
+}
+
+/**
+ * Suggest the next targeted practice activity for one active goal.
+ * Deterministic selection over EXISTING problems; the plan is persisted
+ * and surfaced (offered) — never auto-started, never generated content.
+ * Never throws; every failure degrades to an honest message.
+ */
+async function suggestNextActivityFlow(goalId?: string): Promise<void> {
+  try {
+    const goals = await activeGoalStore().listGoals().catch(() => []);
+    const active = getActiveGoals(goals);
+    if (active.length === 0) {
+      void vscode.window.showInformationMessage(
+        'CodeSense: no active learning goal yet. Review or set a goal first, then ask for practice.',
+      );
+      return;
+    }
+    let goal = goalId !== undefined ? (active.find((candidate) => candidate.goalId === goalId) ?? null) : null;
+    if (goal === null && goalId === undefined && active.length === 1 && active[0] !== undefined) {
+      goal = active[0];
+    }
+    if (goal === null && goalId === undefined) {
+      interface GoalPick extends vscode.QuickPickItem {
+        goalId: string;
+      }
+      const picked = await vscode.window.showQuickPick(
+        active.map(
+          (candidate): GoalPick => ({
+            label: candidate.description,
+            description: `${candidate.dimension} · ${candidate.source === 'learner-requested' ? 'my goal' : 'from evidence'}`,
+            goalId: candidate.goalId,
+          }),
+        ),
+        { placeHolder: 'Which goal should the practice serve?' },
+      );
+      if (!picked) {
+        return;
+      }
+      goal = active.find((candidate) => candidate.goalId === picked.goalId) ?? null;
+    }
+    if (goal === null) {
+      return;
+    }
+    const [catalog, profile, evidence, attempts, priorPlans] = await Promise.all([
+      loadPracticeCatalog(),
+      activeLearnerModelStore().loadProfile().catch(() => null),
+      activeLearnerEvidenceStore().listEvidence().catch(() => []),
+      loadAllAttempts(),
+      activeActivityPlanStore().listPlans().catch(() => []),
+    ]);
+    const inFlight = getActivePlansForGoal(priorPlans, goal.goalId);
+    if (inFlight.length > 0 && inFlight[0] !== undefined) {
+      const current = inFlight[0];
+      const summary = summarizePlanForLearner(current, {
+        goalDescription: goal.description,
+        siblingPlans: priorPlans,
+      });
+      const reopen = await vscode.window.showInformationMessage(
+        `CodeSense practice (already suggested):\n${summary.title}\n${summary.purposeLabel}\n${summary.why}`,
+        'Open problem',
+        'Later',
+      );
+      if (reopen === 'Open problem') {
+        const problem = await activeProblemStore().getProblem(current.problemId).catch(() => null);
+        if (problem) {
+          void vscode.env.openExternal(vscode.Uri.parse(problem.canonicalUrl));
+        }
+      }
+      return;
+    }
+    const outcome = planNextActivity({
+      goal,
+      graph: getDefaultKnowledgeGraph(),
+      profile,
+      evidence,
+      catalog,
+      attempts,
+      priorPlans,
+      now: new Date().toISOString(),
+    });
+    if (outcome.status === 'no-plan') {
+      void vscode.window.showInformationMessage(
+        `CodeSense practice: no suggestion right now (${outcome.reason}).`,
+      );
+      return;
+    }
+    const selected = outcome.plans[0];
+    if (selected === undefined) {
+      return;
+    }
+    const planStore = activeActivityPlanStore();
+    await planStore
+      .upsertPlan(selected)
+      .catch((err: unknown) => {
+        console.error('CodeSense: failed to persist activity plan', err);
+      });
+    const offered = offerPlan(selected, new Date().toISOString());
+    await planStore
+      .upsertPlan(offered)
+      .catch((err: unknown) => {
+        console.error('CodeSense: failed to persist offered plan', err);
+      });
+    const shown = summarizePlanForLearner(offered, {
+      goalDescription: goal.description,
+      siblingPlans: [offered],
+    });
+    const pick = await vscode.window.showInformationMessage(
+      `CodeSense practice suggestion:\n${shown.title}\n${shown.purposeLabel}\n${shown.why}\nSupports: ${shown.goalDescription ?? goal.description}`,
+      'Open problem',
+      'Mark started',
+      'Later',
+    );
+    if (pick === 'Open problem') {
+      const problem = await activeProblemStore().getProblem(offered.problemId).catch(() => null);
+      if (problem) {
+        void vscode.env.openExternal(vscode.Uri.parse(problem.canonicalUrl));
+      }
+    } else if (pick === 'Mark started') {
+      try {
+        await planStore.upsertPlan(startPlan(offered, new Date().toISOString()));
+        void vscode.window.showInformationMessage(
+          'CodeSense: practice marked as started. Your attempt stays linked to the goal.',
+        );
+      } catch (err) {
+        console.error('CodeSense: failed to mark plan started', err);
+      }
+    }
+  } catch (err) {
+    console.error('CodeSense: failed to suggest practice activity', err);
+  }
+}
+
+/**
+ * Evidence-feedback seam: when an attempt starts on a problem with an
+ * offered/started plan for an active goal, record the association. The
+ * attempt lifecycle is untouched — only the plan gains a linkedAttemptId,
+ * so later evidence stays attributable to activity → goal.
+ */
+async function maybeLinkAttemptToPlan(attempt: Attempt, problem: Problem): Promise<void> {
+  try {
+    const [goals, plans] = await Promise.all([
+      activeGoalStore().listGoals().catch(() => []),
+      activeActivityPlanStore().listPlans().catch(() => []),
+    ]);
+    const activeIds = new Set(getActiveGoals(goals).map((candidate) => candidate.goalId));
+    const candidate = plans.find(
+      (plan) =>
+        plan.problemId === problem.problemId &&
+        activeIds.has(plan.goalId) &&
+        (plan.status === 'offered' || plan.status === 'started') &&
+        plan.linkedAttemptId === null,
+    );
+    if (!candidate) {
+      return;
+    }
+    await activeActivityPlanStore().upsertPlan(
+      linkAttemptToPlan(candidate, attempt, new Date().toISOString()),
+    );
+  } catch (err) {
+    console.error('CodeSense: failed to link attempt to practice plan', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase F3: practice evidence feedback & goal reassessment (background, fail-open)
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluates goal-relative progress for activity plans linked to a
+ * finalized attempt. Reads finalized stores only — adds no D evidence,
+ * transitions no goals or plans, selects no next activity. Persists
+ * evaluated records; surfaces only review-grade signals (the learner
+ * decides what happens to their goals). Never throws.
+ */
+async function maybeEvaluateProgressAfterProblemEnd(attempt: Attempt): Promise<void> {
+  try {
+    const [goals, plans, evidence, profile, priorProgress] = await Promise.all([
+      activeGoalStore().listGoals().catch(() => []),
+      activeActivityPlanStore().listPlans().catch(() => []),
+      activeLearnerEvidenceStore().listEvidence().catch(() => []),
+      activeLearnerModelStore().loadProfile().catch(() => null),
+      activeProgressStore().listProgress().catch(() => []),
+    ]);
+    const linked = plans.filter(
+      (plan) =>
+        plan.linkedAttemptId === attempt.attemptId &&
+        (plan.status === 'offered' || plan.status === 'started' || plan.status === 'completed'),
+    );
+    if (linked.length === 0) {
+      return;
+    }
+    const goalById = new Map(goals.map((goal) => [goal.goalId, goal] as const));
+    const store = activeProgressStore();
+    let progressed = [...priorProgress];
+    for (const plan of linked) {
+      const goal = goalById.get(plan.goalId) ?? null;
+      if (!goal) {
+        continue;
+      }
+      const outcome = evaluateActivityProgress({
+        goal,
+        plan,
+        attempt,
+        evidence,
+        profile,
+        graph: getDefaultKnowledgeGraph(),
+        priorProgress: progressed,
+        now: new Date().toISOString(),
+      });
+      if (outcome.status !== 'evaluated' || !outcome.updated) {
+        continue;
+      }
+      await store.upsertProgress(outcome.progress).catch((err: unknown) => {
+        console.error('CodeSense: failed to persist activity progress', err);
+      });
+      progressed = [
+        ...progressed.filter((entry) => entry.progressId !== outcome.progress.progressId),
+        outcome.progress,
+      ];
+      if (
+        outcome.progress.reassessment === 'sufficient-evidence-for-review' ||
+        outcome.progress.reassessment === 'review-goal'
+      ) {
+        const summary = summarizeProgressForLearner(outcome.progress, {
+          goalDescription: goal.description,
+        });
+        const pick = await vscode.window.showInformationMessage(
+          `CodeSense goal update:\n${summary.summary}\n${summary.nextStep}`,
+          'Review goal',
+          'Later',
+        );
+        if (pick === 'Review goal') {
+          void reviewLearningGoals();
+        }
+      }
+    }
+  } catch (err) {
+    console.error('CodeSense: failed to evaluate activity progress', err);
+  }
+}
+
 /** Phase D: bounded learner-model digest for the coach context (fail-open). */
 async function loadLearnerNotes(): Promise<string[]> {
   try {
@@ -1274,7 +1941,15 @@ async function loadLearnerNotes(): Promise<string[]> {
     if (!profile) {
       return [];
     }
-    return buildLearnerNotesForPrompt(profile);
+    const notes = buildLearnerNotesForPrompt(profile);
+    // Phase F1: append the bounded active-goal digest (same channel, same
+    // caps philosophy). Zero changes to Phase E files were needed.
+    try {
+      const goals = await activeGoalStore().listGoals().catch(() => []);
+      return [...notes, ...summarizeGoalsForPrompt(goals)];
+    } catch {
+      return notes;
+    }
   } catch (err) {
     console.error('CodeSense: failed to load learner model for AI context; continuing without it', err);
     return [];
@@ -1653,6 +2328,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const evaluateNowDisposable = vscode.commands.registerCommand('codesense.evaluateNow', () => {
     requestManualEvaluation();
   });
+  const reviewGoalsDisposable = vscode.commands.registerCommand('codesense.reviewLearningGoals', () => {
+    void reviewLearningGoals();
+  });
+  const suggestPracticeDisposable = vscode.commands.registerCommand('codesense.suggestNextActivity', () => {
+    void suggestNextActivityFlow();
+  });
   const menuDisposable = vscode.commands.registerCommand('codesense.showMenu', () => {
     void showMenu();
   });
@@ -1954,6 +2635,8 @@ export function activate(context: vscode.ExtensionContext): void {
     setStateDisposable,
     historyDisposable,
     evaluateNowDisposable,
+    reviewGoalsDisposable,
+    suggestPracticeDisposable,
     menuDisposable,
     timelineDisposable,
     locationDisposable,
