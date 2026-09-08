@@ -6,9 +6,10 @@
  *   CODESENSE_AI_MODEL        Default: gpt-4o-mini
  *   CODESENSE_AI_TIMEOUT_MS   Default: 60000
  *
- * Values may come from a project-root `.env` file (loaded once at extension
- * startup via `loadWorkspaceEnvFile`) or from the process environment
- * directly. Explicitly set environment variables always win over `.env`.
+ * Values may come from a `.env` file next to the extension installation
+ * (loaded once at extension startup via `loadEnvFile`) or from the process
+ * environment directly. Explicitly set environment variables always win
+ * over `.env`.
  *
  * Nothing secret is ever committed or stored in source. The extension reads
  * configuration at evaluation time so tests and harnesses can inject values
@@ -39,20 +40,24 @@ function env(name: string): string {
 }
 
 /**
- * Load `<workspaceRoot>/.env` into process.env, once, at extension startup.
+ * Load `<configDir>/.env` into process.env, once, at extension startup.
+ * The caller passes the extension's own installation/development path, so
+ * AI configuration travels with CodeSense and never depends on which
+ * learner workspace folder happens to be open. Session data keeps living
+ * in the learner workspace; only dev configuration is resolved here.
  *
- * - No workspace root (or no `.env` file there) is a silent no-op: the
+ * - No config dir (or no `.env` file there) is a silent no-op: the
  *   existing environment-variable behavior remains the fallback.
  * - Variables already present in the environment are never overridden;
  *   explicit environment always wins over `.env` (dotenv default).
  * - Never throws: configuration loading must not be able to crash startup.
  */
-export function loadWorkspaceEnvFile(workspaceRoot: string | undefined): void {
-  if (!workspaceRoot) {
+export function loadEnvFile(configDir: string | undefined): void {
+  if (!configDir) {
     return;
   }
   try {
-    dotenv.config({ path: path.join(workspaceRoot, '.env') });
+    dotenv.config({ path: path.join(configDir, '.env') });
   } catch (err) {
     console.error(`CodeSense: failed to load .env (${String(err)})`);
   }

@@ -1,12 +1,14 @@
 import { expect } from 'chai';
 import {
   HARD_LIMIT_MS,
+  IDLE_THRESHOLD_ENV_VAR,
   IDLE_THRESHOLD_MS,
   consumeTrigger,
   createTriggerState,
   evaluateTriggers,
   pollTriggers,
   recordTriggerActivity,
+  resolveIdleThresholdMs,
 } from 'codesense/triggers/triggerEngine';
 
 const MIN = 60 * 1000;
@@ -112,6 +114,53 @@ describe('Trigger engine: consumption without cooldown', () => {
       consumeTrigger(state, first.kind);
     }
     expect(evaluateTriggers(state, t0 + 11 * MIN).eligible).to.be.false;
+  });
+});
+
+describe('Trigger engine: configurable idle threshold (dogfooding override)', () => {
+  it('defaults to 10 minutes when the variable is absent', () => {
+    expect(IDLE_THRESHOLD_MS).to.equal(600_000);
+    expect(resolveIdleThresholdMs({})).to.equal(600_000);
+    expect(resolveIdleThresholdMs({ [IDLE_THRESHOLD_ENV_VAR]: undefined })).to.equal(600_000);
+  });
+
+  it('respects a custom 60-second value', () => {
+    expect(resolveIdleThresholdMs({ [IDLE_THRESHOLD_ENV_VAR]: '60000' })).to.equal(60_000);
+  });
+
+  it('falls back safely on invalid or non-positive values', () => {
+    for (const bad of ['', '   ', 'bogus', 'NaN', 'Infinity', '-5', '0', '-0.5']) {
+      expect(resolveIdleThresholdMs({ [IDLE_THRESHOLD_ENV_VAR]: bad }), JSON.stringify(bad)).to.equal(
+        600_000,
+      );
+    }
+  });
+
+  it('fires idle at the custom threshold without touching the hard boundary', () => {
+    const t0 = 9_000_000;
+    const custom = 60_000;
+    const state = createTriggerState(t0, t0);
+    expect(pollTriggers(state, t0 + 59_999, custom).eligible).to.be.false;
+    const at60 = pollTriggers(state, t0 + 60_000, custom);
+    expect(at60.eligible).to.be.true;
+    expect(at60.kind).to.equal('idle');
+    // Same quiet period: consumed, silent.
+    expect(pollTriggers(state, t0 + 61_000, custom).eligible).to.be.false;
+    expect(HARD_LIMIT_MS).to.equal(45 * MIN);
+  });
+
+  it('hard45 still fires at exactly 45 minutes under a custom idle threshold', () => {
+    const t0 = 10_000_000;
+    const custom = 60_000;
+    const state = createTriggerState(t0, t0);
+    // Activity every 30s keeps the 60s idle condition at bay.
+    for (let s = 30; s < 45 * 60; s += 30) {
+      recordTriggerActivity(state, t0 + s * 1000);
+      expect(pollTriggers(state, t0 + s * 1000, custom).eligible).to.be.false;
+    }
+    const at45 = pollTriggers(state, t0 + 45 * MIN, custom);
+    expect(at45.eligible).to.be.true;
+    expect(at45.kind).to.equal('hard45');
   });
 });
 

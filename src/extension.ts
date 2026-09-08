@@ -55,22 +55,49 @@ import { LocalCheckpointStore } from './history/checkpointStore';
 import { CodeSenseStatusBar } from './ui/statusBar';
 import {
   CodeSenseSidebarProvider,
+  SidebarExchangeMessage,
   buildSidebarSnapshot,
+  withBadgeMetadata,
 } from './ui/sidebarView';
 import {
   StartInput,
   showProblemSetupPanel,
 } from './ui/problemSetupPanel';
 // AI Layer V1 imports (reasoning only — telemetry/lifecycle untouched).
-import { EvaluationTriggerKind, generateConversationMessageId } from './ai/aiTypes';
-import { HttpChatReasoner } from './ai/reasoners';
+import { AIEvaluation, EvaluationTriggerKind, generateConversationMessageId } from './ai/aiTypes';import { HttpChatReasoner } from './ai/reasoners';
 import { LocalAiStore } from './ai/aiStore';
 import { loadEnvFile, readAiConfig } from './ai/aiConfig';
 import { EvaluationOutcome, runAiEvaluation, shouldNotifyProactiveIntervention } from './ai/evaluationRunner';
+import { resolveUIFontSize } from './ui/fontSize';
 import { isAwaitingLearnerResponse } from './ai/conversationStatus';
 import { releaseEvaluation, tryReserveEvaluation } from './ai/evaluationGuard';
+import { resolveRateLimitCooldownMs } from './ai/rateLimit';
 import { buildAIContext } from './context/aiContext';
 import { editRecordsFromEvents, selectAttemptEdits } from './history/codeHistory';
+// Phase C imports (knowledge graph + automatic problem classification:
+// local-first supporting infrastructure — never blocks solving, never
+// mutates the Problem record, never models the learner).
+import { LocalClassificationStore } from './knowledge/classificationStore';
+import { getClassificationStatus } from './knowledge/classification';
+import { getDefaultKnowledgeGraph } from './knowledge/ontologyStore';
+import { HttpProblemClassificationReasoner, runProblemClassification } from './knowledge/classifier';
+// Phase D imports (learner model: evidence-driven beliefs with provenance.
+// Local-first supporting infrastructure — feeds are fire-and-forget and
+// fail-open; they never block solving, coaching, or lifecycle transitions).
+import { LocalLearnerEvidenceStore } from './learner/learnerEvidenceStore';
+import { LocalLearnerModelStore } from './learner/learnerModelStore';
+import { buildLearnerNotesForPrompt } from './learner/learnerQueries';
+import {
+  syncAttemptToLearnerModel,
+  syncEvaluationToLearnerModel,
+} from './learner/learnerFeeds';
+// Phase E imports (personalized coach: deterministic learner-aware context,
+// decision briefing, outcome derivation, finalization packaging, and a
+// secret-free AI I/O trace. Advisory to the model and fail-open throughout;
+// the frozen validator/runner/trigger contracts are untouched).
+import { LocalAiTraceStore } from './ai/aiTrace';
+import { buildCoachContext, summarizeCoachingTurn } from './coach/coachContext';
+import type { CoachContext } from './coach/coachTypes';
 
 /**
  * Phase 0 activity capture: observe document / editor / diagnostics /
@@ -148,19 +175,31 @@ const taskCompletionSeen = new Set<string>();
 // AI Layer V1 state: evaluations in flight (per attempt, stale-guarded),
 // one-time unconfigured notice, and the sidebar AI panel model.
 let aiStore: LocalAiStore | null = null;
+// Phase C state: structured problem knowledge, keyed by problemId in its
+// own local file (the Problem record itself is never rewritten for this).
+let classificationStore: LocalClassificationStore | null = null;
+// Phase D state: append-only learner evidence + the derived learner
+// profile. Both local files; the profile rebuilds from evidence, so the
+// evidence file is the source of truth, never this cache.
+let learnerEvidenceStore: LocalLearnerEvidenceStore | null = null;
+let learnerModelStore: LocalLearnerModelStore | null = null;
+// Phase E state: secret-free AI interaction trace ring (debug aid only,
+// never learner evidence, never uploaded anywhere).
+let aiTraceStore: LocalAiTraceStore | null = null;
 const evaluationInFlight = new Set<string>();
 let aiUnavailableNoticed = false;
+// Local UI/request state for provider rate limiting (epoch ms until Send
+// comes back). Never persisted, never learner state: it only tells the
+// sidebar to show a countdown and disable Send, and expires on its own.
+let rateLimitedUntilMs: number | null = null;
 interface AiPanelState {
   status: 'idle' | 'evaluating' | 'unavailable' | 'error';
   lastMessage: string | null;
   lastAttemptId: string | null;
-  /** Recent conversation tail for lastAttemptId (oldest first). */
-  exchange: Array<{ role: 'coach' | 'learner'; text: string }>;
+  /** Full available conversation for lastAttemptId (oldest first). */
+  exchange: SidebarExchangeMessage[];
 }
 let aiPanel: AiPanelState = { status: 'idle', lastMessage: null, lastAttemptId: null, exchange: [] };
-
-/** Sidebar conversation tail length; the store keeps far more for prompts. */
-const AI_SIDEBAR_EXCHANGE_TAIL = 6;
 
 const TRIGGER_POLL_MS = 30 * 1000;
 
@@ -203,6 +242,34 @@ function activeAiStore(): LocalAiStore {
   return aiStore;
 }
 
+function activeClassificationStore(): LocalClassificationStore {
+  if (!classificationStore) {
+    classificationStore = new LocalClassificationStore(workspaceFsPath());
+  }
+  return classificationStore;
+}
+
+function activeLearnerEvidenceStore(): LocalLearnerEvidenceStore {
+  if (!learnerEvidenceStore) {
+    learnerEvidenceStore = new LocalLearnerEvidenceStore(workspaceFsPath());
+  }
+  return learnerEvidenceStore;
+}
+
+function activeLearnerModelStore(): LocalLearnerModelStore {
+  if (!learnerModelStore) {
+    learnerModelStore = new LocalLearnerModelStore(workspaceFsPath());
+  }
+  return learnerModelStore;
+}
+
+function activeAiTraceStore(): LocalAiTraceStore {
+  if (!aiTraceStore) {
+    aiTraceStore = new LocalAiTraceStore(workspaceFsPath());
+  }
+  return aiTraceStore;
+}
+
 function rebindStores(): void {
   const wsPath = workspaceFsPath();
   store = new LocalSessionStore(wsPath);
@@ -210,6 +277,10 @@ function rebindStores(): void {
   attemptStore = new LocalAttemptStore(wsPath);
   checkpointStore = new LocalCheckpointStore(wsPath);
   aiStore = new LocalAiStore(wsPath);
+  classificationStore = new LocalClassificationStore(wsPath);
+  learnerEvidenceStore = new LocalLearnerEvidenceStore(wsPath);
+  learnerModelStore = new LocalLearnerModelStore(wsPath);
+  aiTraceStore = new LocalAiTraceStore(wsPath);
 }
 
 function getHistoryChannel(): vscode.OutputChannel {
@@ -233,6 +304,43 @@ function refreshStatusBar(): void {
 }
 
 let sidebarProvider: CodeSenseSidebarProvider | null = null;
+
+/** Extension-global state key for the shared CodeSense UI font size. */
+const UI_FONT_SIZE_STATE_KEY = 'codesense.uiFontSize';
+
+/**
+ * Shared CodeSense UI font-size preference (presentation only, never
+ * learner/telemetry state). Owned by the host, persisted in extension
+ * global state so it survives reloads, and broadcast to every open
+ * CodeSense webview. Webviews additionally keep their own last-applied
+ * value for instant first paint; the host value wins on (re)connect.
+ */
+let uiFontSize = 'medium';
+const openProblemPanels = new Set<vscode.WebviewPanel>();
+let extensionContext: vscode.ExtensionContext | null = null;
+
+function getUiFontSize(): string {
+  return uiFontSize;
+}
+
+function setUiFontSize(raw: string, origin: 'sidebar' | 'panel'): void {
+  const size = resolveUIFontSize(raw);
+  if (size === uiFontSize) {
+    return;
+  }
+  uiFontSize = size;
+  try {
+    void extensionContext?.globalState.update(UI_FONT_SIZE_STATE_KEY, size);
+  } catch {
+    // Persistence best-effort; the live value still broadcasts below.
+  }
+  for (const panel of openProblemPanels) {
+    void panel.webview.postMessage({ command: 'fontSize', size });
+  }
+  if (origin === 'panel') {
+    sidebarProvider?.pushFontSize(size);
+  }
+}
 
 /** Push current domain state to the sidebar (cached until the view resolves). */
 function updateSidebar(): void {
@@ -264,11 +372,20 @@ function updateSidebar(): void {
     const visibleAttemptId = hasActiveProblem && activeAttempt ? activeAttempt.attemptId : null;
     const forVisibleAttempt =
       aiPanel.lastAttemptId !== null && aiPanel.lastAttemptId === visibleAttemptId;
+    // A confirmed provider rate limit travels to the sidebar as UI state
+    // only (epoch ms, never persisted). Expired values are dropped here so
+    // Send re-enables even without another evaluation running.
+    const rateLimitedUntil =
+      rateLimitedUntilMs !== null && rateLimitedUntilMs > Date.now() ? rateLimitedUntilMs : null;
+    if (rateLimitedUntil === null) {
+      rateLimitedUntilMs = null;
+    }
     snapshot.ai = {
       status: aiPanel.status,
       message: forVisibleAttempt ? aiPanel.lastMessage : null,
       exchange: forVisibleAttempt ? aiPanel.exchange : [],
       canReply: hasActiveProblem,
+      ...(rateLimitedUntil !== null ? { rateLimitedUntil } : {}),
     };
   }
   sidebarProvider.update(snapshot);
@@ -506,6 +623,11 @@ async function handleProblemStart(input: StartInput): Promise<{ ok: true } | { o
   void vscode.window.showInformationMessage(
     `CodeSense: problem "${problemLabel(problem)}" started. State: In Progress.`,
   );
+  // Phase C: classify the problem's knowledge requirements in the
+  // background. Fire-and-forget by design — classification never blocks
+  // solving, never rewrites the Problem record, and stays silent on every
+  // outcome (the problem is fully usable classified or not).
+  void maybeClassifyProblem(problem);
   return { ok: true };
 }
 
@@ -520,12 +642,22 @@ function startProblemFlow(): void {
     );
     return;
   }
-  showProblemSetupPanel({
-    onStart: (input: StartInput) => handleProblemStart(input),
-    onCancel: () => {
-      // Nothing pending in the manual-only flow; the hook exists so a
-      // future re-enabled fetch step can reset its state here.
+  const panel = showProblemSetupPanel(
+    {
+      onStart: (input: StartInput) => handleProblemStart(input),
+      onCancel: () => {
+        // Nothing pending in the manual-only flow; the hook exists so a
+        // future re-enabled fetch step can reset its state here.
+      },
+      onFontSizeChange: (size: string) => {
+        setUiFontSize(size, 'panel');
+      },
     },
+    uiFontSize,
+  );
+  openProblemPanels.add(panel);
+  panel.onDidDispose(() => {
+    openProblemPanels.delete(panel);
   });
 }
 
@@ -619,6 +751,9 @@ async function endProblem(): Promise<Attempt | null> {
     attemptId: attempt.attemptId,
     finalState: attempt.currentState,
   });
+  // Phase D: feed the completed attempt to the learner model in the
+  // background. Fire-and-forget — history and lifecycle are already safe.
+  void maybeSyncAttemptToLearnerModel(attempt, problem);
   // Ending a problem resets the trigger lifecycle (§32): drop per-attempt state.
   activeAttempt = null;
   activeProblem = null;
@@ -650,6 +785,17 @@ async function showProblemHistory(): Promise<void> {
     channel.appendLine(`Problem: ${problemLabel(problem)}`);
     channel.appendLine(`  provider: ${problem.provider} | id: ${problem.providerId ?? 'n/a'}`);
     channel.appendLine(`  url: ${problem.canonicalUrl} | source: ${problem.provenance.source}`);
+    // Phase C: one-line knowledge status (fail-open; history never depends on it).
+    try {
+      const classification = await activeClassificationStore().getClassification(problem.problemId);
+      channel.appendLine(
+        classification
+          ? `  knowledge: ${getClassificationStatus(classification)} (confidence: ${classification.confidence}, ontology ${classification.ontologyVersion})`
+          : '  knowledge: unclassified',
+      );
+    } catch {
+      channel.appendLine('  knowledge: unclassified');
+    }
     let attempts: Attempt[] = [];
     try {
       attempts = await activeAttemptStore().listAttemptsForProblem(problem.problemId);
@@ -900,17 +1046,43 @@ async function maybeRunAiEvaluation(
           activeAttempt && activeProblem
             ? { attempt: activeAttempt, problem: activeProblem }
             : null,
-        buildContext: async (target, targetProblem) => buildEvaluationContext(target, targetProblem),
+        buildContext: async (target, targetProblem) => buildEvaluationContext(target, targetProblem, kind),
         reasoner: new HttpChatReasoner({ baseUrl: config.baseUrl, apiKey: config.apiKey, model: config.model }),
         saveEvaluation: (evaluation) => activeAiStore().saveEvaluation(evaluation),
         appendConversation: (message) => activeAiStore().appendConversation(message),
         isAttemptStillActive: (attemptId) => activeAttempt?.attemptId === attemptId,
         timeoutMs: config.timeoutMs,
+        // Phase E developer trace: secret-free stage events into the local
+        // capped ring. Fail-open — a trace failure never affects coaching.
+        onTrace: (event) => {
+          void (async () => {
+            try {
+              await activeAiTraceStore().appendTrace({
+                traceId: event.traceId,
+                at: new Date().toISOString(),
+                stage: event.stage,
+                attemptId: event.attemptId,
+                evaluationId: event.evaluationId,
+                triggerKind: event.triggerKind,
+                summary: event.summary.slice(0, 300),
+                ...(event.preview !== undefined ? { preview: event.preview.slice(0, 500) } : {}),
+              });
+            } catch (err) {
+              console.error('CodeSense: failed to persist AI trace event', err);
+            }
+          })();
+        },
       },
       { attemptId: attempt.attemptId, triggerKind: kind, reason },
     );
     if (outcome.status === 'evaluated') {
       const evaluation = outcome.evaluation;
+      // A completed evaluation proves the provider is answering again, so a
+      // stale rate-limit countdown is lifted for the current attempt instead
+      // of lingering until expiry.
+      if (evaluation.attemptId === activeAttempt?.attemptId) {
+        rateLimitedUntilMs = null;
+      }
       recordEvent(session, 'ai.evaluated', 'session', {
         evaluationId: evaluation.evaluationId,
         attemptId: evaluation.attemptId,
@@ -918,6 +1090,50 @@ async function maybeRunAiEvaluation(
         shouldIntervene: evaluation.shouldIntervene,
         interventionType: evaluation.interventionType,
       });
+      // Phase D: feed grounded diagnoses to the learner model in the
+      // background. Silent evaluations produce no evidence by design.
+      if (problem) {
+        void maybeSyncEvaluationToLearnerModel(evaluation, problem);
+      }
+      // Phase E: deterministic turn summary (diagnosis + recommendation)
+      // into the debug trace. Pure derivation, fail-open, coaching
+      // behavior unchanged — this only records WHY the turn looked the
+      // way it did for future debugging.
+      void (async () => {
+        try {
+          if (!problem) {
+            return;
+          }
+          const turned =
+            (await activeAttemptStore().getAttempt(evaluation.attemptId).catch(() => null)) ??
+            (live.attemptId === evaluation.attemptId ? live : null);
+          if (!turned) {
+            return;
+          }
+          const briefing = await loadCoachContext(turned, problem, kind);
+          if (!briefing) {
+            return;
+          }
+          const { diagnosis, decision } = summarizeCoachingTurn({
+            evaluation,
+            coachContext: briefing,
+            attemptState: turned.currentState,
+          });
+          await activeAiTraceStore().appendTrace({
+            traceId: `trace_${evaluation.attemptId}_${Date.now()}_turn`,
+            at: new Date().toISOString(),
+            stage: 'completed',
+            attemptId: evaluation.attemptId,
+            evaluationId: evaluation.evaluationId,
+            triggerKind: kind,
+            summary:
+              `Turn summary: ${diagnosis.difficultyType}/${diagnosis.confidence} ` +
+              `objective=${diagnosis.pedagogicalObjective} proposed=${decision.proposed}`,
+          });
+        } catch (err) {
+          console.error('CodeSense: failed to trace coaching turn summary', err);
+        }
+      })();
       if (outcome.displayed) {
         aiPanel = { status: 'idle', lastMessage: evaluation.message, lastAttemptId: evaluation.attemptId, exchange: aiPanel.exchange };
       } else {
@@ -938,7 +1154,13 @@ async function maybeRunAiEvaluation(
     } else if (outcome.status === 'failed') {
       console.error(`CodeSense: AI evaluation failed (${outcome.reason}): ${outcome.detail}`);
       aiPanel = { status: 'error', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
-      if (kind === 'manual' || kind === 'reply') {
+      if (outcome.reason === 'rate-limited') {
+        // Confirmed provider rate limit (HTTP 429): enter the local UI
+        // cooldown — sidebar shows a countdown and disables Send until it
+        // lifts. No popup: the inline countdown is the specific message.
+        // Telemetry and the failure panel state behave exactly as before.
+        rateLimitedUntilMs = Date.now() + resolveRateLimitCooldownMs(outcome.retryAfterMs);
+      } else if (kind === 'manual' || kind === 'reply') {
         // User-initiated requests get a visible failure notice (triggered
         // evaluations stay panel-only to avoid nagging); the learner's
         // already-submitted reply is untouched in the store.
@@ -957,10 +1179,160 @@ async function maybeRunAiEvaluation(
 }
 
 /**
+ * Phase C background classification for one problem.
+ * Never throws: every failure mode degrades to "problem stays
+ * unclassified" plus a console log. Never touches the Problem record,
+ * never notifies the learner, never models learner ability.
+ */
+async function maybeClassifyProblem(problem: Problem): Promise<void> {
+  try {
+    const config = readAiConfig();
+    if (!config.enabled) {
+      // No AI configured: the problem simply stays unclassified (usable).
+      // Deliberately silent — classification is infrastructure, not a nag.
+      return;
+    }
+    await runProblemClassification(
+      {
+        reasoner: new HttpProblemClassificationReasoner({
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
+          model: config.model,
+        }),
+        store: activeClassificationStore(),
+        graph: getDefaultKnowledgeGraph(),
+        model: config.model,
+        nowIso: () => new Date().toISOString(),
+        timeoutMs: config.timeoutMs,
+      },
+      problem,
+    );
+  } catch (err) {
+    console.error('CodeSense: background problem classification failed', err);
+  }
+}
+
+/**
+ * Phase D background learner-model feeds. Each helper gathers its inputs
+ * best-effort, syncs evidence + derived profile, and NEVER throws: a
+ * learner-model failure degrades to "no model update" plus a console log.
+ * Never awaited by lifecycle code (always `void`), so solving, coaching,
+ * and transitions proceed identically with or without a learner model.
+ */
+async function maybeSyncAttemptToLearnerModel(attempt: Attempt, problem: Problem): Promise<void> {
+  try {
+    const [classification, evaluations] = await Promise.all([
+      (async () => problem.classification ?? (await activeClassificationStore().getClassification(problem.problemId).catch(() => null)))(),
+      activeAiStore().listEvaluationsForAttempt(attempt.attemptId).catch(() => []),
+    ]);
+    await syncAttemptToLearnerModel(
+      {
+        evidenceStore: activeLearnerEvidenceStore(),
+        modelStore: activeLearnerModelStore(),
+        graph: getDefaultKnowledgeGraph(),
+        nowIso: () => new Date().toISOString(),
+      },
+      { attempt, problem, classification, evaluations },
+    );
+  } catch (err) {
+    console.error('CodeSense: background learner-model attempt sync failed', err);
+  }
+}
+
+async function maybeSyncEvaluationToLearnerModel(
+  evaluation: AIEvaluation,
+  problem: Problem,
+): Promise<void> {
+  try {
+    // Anchor to the evaluation's OWN attempt (stale-safe: the learner may
+    // have moved on while the model was thinking).
+    const attempt = await activeAttemptStore().getAttempt(evaluation.attemptId).catch(() => null);
+    if (!attempt) {
+      return;
+    }
+    const classification = await activeClassificationStore()
+      .getClassification(problem.problemId)
+      .catch(() => null);
+    await syncEvaluationToLearnerModel(
+      {
+        evidenceStore: activeLearnerEvidenceStore(),
+        modelStore: activeLearnerModelStore(),
+        graph: getDefaultKnowledgeGraph(),
+        nowIso: () => new Date().toISOString(),
+      },
+      { evaluation, attempt, classification: problem.classification ?? classification },
+    );
+  } catch (err) {
+    console.error('CodeSense: background learner-model evaluation sync failed', err);
+  }
+}
+
+/** Phase D: bounded learner-model digest for the coach context (fail-open). */
+async function loadLearnerNotes(): Promise<string[]> {
+  try {
+    const profile = await activeLearnerModelStore().loadProfile();
+    if (!profile) {
+      return [];
+    }
+    return buildLearnerNotesForPrompt(profile);
+  } catch (err) {
+    console.error('CodeSense: failed to load learner model for AI context; continuing without it', err);
+    return [];
+  }
+}
+
+/**
+ * Phase E: deterministic coach context for one attempt (fail-open, null on
+ * any failure). Shared by context assembly and post-evaluation tracing so
+ * both see the same briefing inputs.
+ */
+async function loadCoachContext(
+  target: Attempt,
+  targetProblem: Problem,
+  triggerKind: string,
+): Promise<CoachContext | null> {
+  try {
+    const attemptStore = activeAttemptStore();
+    const problemAttempts = await attemptStore.listAttemptsForProblem(targetProblem.problemId);
+    const previousAttempts = problemAttempts.filter(
+      (a) => a.attemptId !== target.attemptId && a.completedAt !== null,
+    );
+    const [storedClassification, evaluations, profile, evidence, conversation] = await Promise.all([
+      activeClassificationStore().getClassification(targetProblem.problemId).catch(() => null),
+      activeAiStore().listEvaluationsForAttempt(target.attemptId).catch(() => []),
+      activeLearnerModelStore().loadProfile().catch(() => null),
+      activeLearnerEvidenceStore().listEvidence().catch(() => []),
+      activeAiStore().listConversation(target.attemptId).catch(() => []),
+    ]);
+    // Prefer the problem-attached classification (same precedence as the
+    // Phase D feeds) so briefing and evidence agree on problem knowledge.
+    const classification = targetProblem.classification ?? storedClassification;
+    return buildCoachContext({
+      attempt: target,
+      problem: targetProblem,
+      classification: targetProblem.classification ?? classification,
+      profile,
+      evidence,
+      evaluations,
+      conversation,
+      previousAttempts,
+      triggerKind,
+    });
+  } catch (err) {
+    console.error('CodeSense: failed to build coach context; continuing without it', err);
+    return null;
+  }
+}
+
+/**
  * Assemble the scoped evaluation context from existing stores. Deterministic
  * reconstruction owns the source — the model only ever receives it.
  */
-async function buildEvaluationContext(target: Attempt, targetProblem: Problem) {
+async function buildEvaluationContext(
+  target: Attempt,
+  targetProblem: Problem,
+  triggerKind?: string,
+) {
   const session = currentSession;
   const attemptStore = activeAttemptStore();
   const problemAttempts = await attemptStore.listAttemptsForProblem(targetProblem.problemId);
@@ -973,6 +1345,22 @@ async function buildEvaluationContext(target: Attempt, targetProblem: Problem) {
     : [];
   const edits = selectAttemptEdits(editRecordsFromEvents(sessionEvents), target.attemptId);
   const conversation = await activeAiStore().listConversation(target.attemptId);
+  // Phase C: attach the problem's structured knowledge when classified.
+  // Fail-open — an unreadable store means "coach from the statement alone",
+  // exactly the pre-Phase-C behavior; never learner state, never mastery.
+  let classification = null;
+  try {
+    classification = await activeClassificationStore().getClassification(targetProblem.problemId);
+  } catch (err) {
+    console.error('CodeSense: failed to load problem classification; continuing without it', err);
+  }
+  // Phase D: bounded learner-model digest for the coach (Learner Model →
+  // AI context → Coach). Fail-open to no notes — identical to pre-Phase-D.
+  const learnerNotes = await loadLearnerNotes();
+  // Phase E: deterministic learner-aware coaching briefing (bounded slice
+  // of learner state + previous-intervention situation). Fail-open to no
+  // briefing — identical to pre-Phase-E.
+  const coachBriefing = await loadCoachContext(target, targetProblem, triggerKind ?? 'manual');
   return buildAIContext({
     problem: targetProblem,
     attempt: target,
@@ -981,6 +1369,9 @@ async function buildEvaluationContext(target: Attempt, targetProblem: Problem) {
     checkpoints,
     sessionEvents,
     conversation,
+    ...(classification ? { classification } : {}),
+    ...(learnerNotes.length > 0 ? { learnerContext: { notes: learnerNotes } } : {}),
+    ...(coachBriefing ? { coachBriefing } : {}),
   });
 }
 
@@ -1023,11 +1414,16 @@ async function refreshAiExchange(attemptId: string): Promise<void> {
     return;
   }
   try {
-    const all = await activeAiStore().listConversation(attemptId);
+    const [all, evaluations] = await Promise.all([
+      activeAiStore().listConversation(attemptId),
+      activeAiStore().listEvaluationsForAttempt(attemptId),
+    ]);
     aiPanel.lastAttemptId = attemptId;
-    aiPanel.exchange = all
-      .slice(-AI_SIDEBAR_EXCHANGE_TAIL)
-      .map((m) => ({ role: m.role, text: m.text }));
+    // Post-polish chat UI shows the entire available conversation (oldest
+    // first) in a scrollable area. The store cap bounds how much exists;
+    // nothing is truncated here and the schema is unchanged. Badge metadata
+    // comes from the already-persisted linked evaluations (view-model only).
+    aiPanel.exchange = withBadgeMetadata(all, evaluations);
   } catch (err) {
     console.error('CodeSense: failed to refresh AI conversation', err);
     return;
@@ -1183,6 +1579,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // path or missing .env is a silent no-op; explicit environment variables
   // keep working as before. Session data still lives in the workspace.
   loadEnvFile(context.extensionPath);
+  extensionContext = context;
+  try {
+    uiFontSize = resolveUIFontSize(context.globalState.get(UI_FONT_SIZE_STATE_KEY));
+  } catch {
+    // Unavailable storage must never block activation; Medium default stands.
+  }
   rebindStores();
   statusBar = new CodeSenseStatusBar();
   refreshStatusBar();
@@ -1213,6 +1615,10 @@ export function activate(context: vscode.ExtensionContext): void {
     },
     aiReply: (text: string) => {
       void handleAiReply(text);
+    },
+    getFontSize: () => getUiFontSize(),
+    setFontSize: (size: string) => {
+      setUiFontSize(size, 'sidebar');
     },
   });
   const sidebarDisposable = vscode.window.registerWebviewViewProvider(
@@ -1613,6 +2019,13 @@ export function deactivate(): void {
     void storeRef.saveAttempt(pending).then(undefined, (err: unknown) => {
       console.error('CodeSense: failed to persist attempt on deactivate', err);
     });
+    // Phase E finalization (§16–18): route the interrupted attempt through
+    // the SAME existing evidence machinery as End Problem (best-effort on
+    // shutdown; the sync helpers never throw). No duplicate system is
+    // created; session finalization below adds no learner evidence.
+    if (problem) {
+      void maybeSyncAttemptToLearnerModel(pending, problem);
+    }
     activeAttempt = null;
     activeProblem = null;
     activeTrigger = null;

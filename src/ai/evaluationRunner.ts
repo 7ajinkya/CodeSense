@@ -5,10 +5,13 @@ import {
   EvaluationTriggerKind,
   validateAIEvaluation,
 } from './aiTypes';
-import { coachMessage } from './reasoners';
+import { coachMessage, HttpProviderError } from './reasoners';
+import { parseRetryAfterDelayMs } from './rateLimit';
 import { AIContext } from '../context/aiContext';
 import { Attempt } from '../attempts/attempt';
 import { Problem } from '../problems/problem';
+import { randomUUID } from 'crypto';
+import type { AITraceStage } from './aiTrace';
 
 /**
  * AI evaluation lifecycle (TRANSPORT for the pedagogical decision).
@@ -49,12 +52,32 @@ export interface EvaluationPorts {
   /** Re-checked after the model responds, before anything is displayed. */
   isAttemptStillActive(attemptId: string): boolean;
   timeoutMs: number;
+  /**
+   * Phase E developer-trace sink (optional; additive). Invoked at each
+   * pipeline stage with secret-free summaries. A throwing sink must never
+   * break evaluation — emissions are guarded.
+   */
+  onTrace?: (event: {
+    traceId: string;
+    stage: AITraceStage;
+    attemptId: string | null;
+    evaluationId: string | null;
+    triggerKind: string | null;
+    summary: string;
+    preview?: string;
+  }) => void;
 }
 
 export type EvaluationOutcome =
   | { status: 'evaluated'; evaluation: AIEvaluation; displayed: boolean }
   | { status: 'skipped'; reason: 'no-active-attempt' }
-  | { status: 'failed'; reason: 'timeout' | 'provider-error' | 'malformed-response'; detail: string };
+  | {
+      status: 'failed';
+      reason: 'timeout' | 'provider-error' | 'malformed-response' | 'rate-limited';
+      detail: string;
+      /** Provider-supplied retry delay for rate limits; absent/unusable without Retry-After. */
+      retryAfterMs?: number;
+    };
 
 /**
  * Deterministic fallback check-in for the 45-minute hard boundary when the
@@ -112,21 +135,61 @@ export async function runAiEvaluation(
   ports: EvaluationPorts,
   request: EvaluationRequest,
 ): Promise<EvaluationOutcome> {
+  const traceId = 'trace_' + randomUUID();
+  const emit = (
+    stage: AITraceStage,
+    summary: string,
+    extra: { attemptId?: string | null; evaluationId?: string | null; triggerKind?: string | null; preview?: string } = {},
+  ): void => {
+    try {
+      ports.onTrace?.({
+        traceId,
+        stage,
+        attemptId: extra.attemptId ?? request.attemptId,
+        evaluationId: extra.evaluationId ?? null,
+        triggerKind: extra.triggerKind ?? request.triggerKind,
+        summary,
+        ...(extra.preview !== undefined ? { preview: extra.preview } : {}),
+      });
+    } catch {
+      // Trace sinks are debug aids; they must never break evaluation.
+    }
+  };
   const active = ports.getActiveAttempt();
   if (!active || active.attempt.attemptId !== request.attemptId) {
     return { status: 'skipped', reason: 'no-active-attempt' };
   }
   const context = await ports.buildContext(active.attempt, active.problem);
+  emit('context-assembled', `AIContext v${context.version} assembled for ${request.triggerKind}`);
   let raw: unknown;
   try {
+    emit('request-sent', 'Provider request dispatched (headers/keys never traced)');
     raw = await withTimeout(ports.reasoner.evaluate(context, {}), ports.timeoutMs);
+    emit('response-received', 'Provider response received, parsing envelope');
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('AI evaluation timed out')) {
+      emit('completed', 'Evaluation failed: timeout');
       return { status: 'failed', reason: 'timeout', detail: err.message };
     }
     if (err instanceof SyntaxError) {
+      emit('completed', 'Evaluation failed: malformed-response');
       return { status: 'failed', reason: 'malformed-response', detail: err.message };
     }
+    // Rate limiting is classified here at the transport edge: only HTTP 429
+    // becomes 'rate-limited'. Every other provider failure keeps the generic
+    // 'provider-error' outcome, and timeouts/malformed output above are
+    // untouched. Nothing is persisted for any failure either way.
+    if (err instanceof HttpProviderError && err.status === 429) {
+      const retryAfterMs = parseRetryAfterDelayMs(err.retryAfter);
+      emit('completed', 'Evaluation failed: rate-limited');
+      return {
+        status: 'failed',
+        reason: 'rate-limited',
+        detail: err.message,
+        ...(retryAfterMs !== null ? { retryAfterMs } : {}),
+      };
+    }
+    emit('completed', 'Evaluation failed: provider-error');
     return {
       status: 'failed',
       reason: 'provider-error',
@@ -139,8 +202,14 @@ export async function runAiEvaluation(
     timestamp: ports.nowIso(),
   });
   if (!validated) {
+    emit('validation-failed', 'Provider output failed schema validation');
     return { status: 'failed', reason: 'malformed-response', detail: 'provider output failed schema validation' };
   }
+  emit(
+    'validation-passed',
+    validated.shouldIntervene ? `Intervening as ${validated.interventionType}` : 'Silent look, no intervention',
+    { evaluationId: validated.evaluationId },
+  );
   // hard45 invariant: a mandatory check-in ALWAYS produces a learner-facing
   // response. A model NONE is normalized to a minimal deterministic
   // ACKNOWLEDGE (never a hint); any real intervention type passes through
@@ -170,5 +239,9 @@ export async function runAiEvaluation(
   // response that arrives after the learner moved on must never display
   // inside the new attempt.
   const stillActive = ports.isAttemptStillActive(request.attemptId);
-  return { status: 'evaluated', evaluation, displayed: stillActive && evaluation.shouldIntervene };
+  const displayed = stillActive && evaluation.shouldIntervene;
+  emit('completed', displayed ? 'Evaluated and displayed' : 'Evaluated without display', {
+    evaluationId: evaluation.evaluationId,
+  });
+  return { status: 'evaluated', evaluation, displayed };
 }

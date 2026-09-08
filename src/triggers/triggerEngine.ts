@@ -17,10 +17,31 @@
  *
  * This module only DECIDES eligibility. Checkpoint creation, persistence and
  * notification live in the extension wiring.
+ *
+ * The idle threshold defaults to 10 minutes but can be overridden for
+ * dogfooding via CODESENSE_IDLE_THRESHOLD_MS (see resolveIdleThresholdMs).
+ * The 45-minute hard boundary is never configurable.
  */
 
 export const IDLE_THRESHOLD_MS = 10 * 60 * 1000;
 export const HARD_LIMIT_MS = 45 * 60 * 1000;
+
+/** Environment override for the idle threshold, in milliseconds. */
+export const IDLE_THRESHOLD_ENV_VAR = 'CODESENSE_IDLE_THRESHOLD_MS';
+
+/**
+ * Resolve the idle threshold: the env value when it parses to a positive
+ * finite number of milliseconds, otherwise the 10-minute production
+ * default. Takes the env record as a parameter so callers stay explicit
+ * and tests stay hermetic (no process.env mutation needed).
+ */
+export function resolveIdleThresholdMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number((env[IDLE_THRESHOLD_ENV_VAR] ?? '').trim());
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return IDLE_THRESHOLD_MS;
+  }
+  return Math.floor(raw);
+}
 
 export type TriggerKind = 'idle' | 'hard45';
 
@@ -68,9 +89,15 @@ export function recordTriggerActivity(state: AttemptTriggerState, nowMs: number)
 /**
  * Evaluate eligibility at `nowMs`. Pure except for reading the state.
  * When both conditions hold, the strict 45-minute boundary is reported
- * (it is the stronger, non-negotiable signal).
+ * (it is the stronger, non-negotiable signal). The idle threshold is a
+ * parameter so dogfooding overrides stay at the call edge; it defaults to
+ * the 10-minute production value and never affects the hard boundary.
  */
-export function evaluateTriggers(state: AttemptTriggerState, nowMs: number): TriggerEvaluation {
+export function evaluateTriggers(
+  state: AttemptTriggerState,
+  nowMs: number,
+  idleThresholdMs: number = IDLE_THRESHOLD_MS,
+): TriggerEvaluation {
   const elapsed = nowMs - state.attemptStartedAtMs;
   if (!state.hard45Consumed && elapsed >= HARD_LIMIT_MS) {
     return {
@@ -80,11 +107,11 @@ export function evaluateTriggers(state: AttemptTriggerState, nowMs: number): Tri
     };
   }
   const idleFor = nowMs - state.lastActivityAtMs;
-  if (idleFor >= IDLE_THRESHOLD_MS && state.idleConsumedForActivityAtMs !== state.lastActivityAtMs) {
+  if (idleFor >= idleThresholdMs && state.idleConsumedForActivityAtMs !== state.lastActivityAtMs) {
     return {
       eligible: true,
       kind: 'idle',
-      reason: `idle for ${Math.floor(idleFor / 60000)}m (threshold ${IDLE_THRESHOLD_MS / 60000}m)`,
+      reason: `idle for ${Math.floor(idleFor / 60000)}m (threshold ${idleThresholdMs / 60000}m)`,
     };
   }
   return { eligible: false, kind: null, reason: 'no trigger condition met' };
@@ -103,8 +130,12 @@ export function consumeTrigger(state: AttemptTriggerState, kind: TriggerKind): v
  * Convenience: evaluate and consume in one step. Returns the evaluation
  * (with `eligible: true` exactly once per trigger instance).
  */
-export function pollTriggers(state: AttemptTriggerState, nowMs: number): TriggerEvaluation {
-  const evaluation = evaluateTriggers(state, nowMs);
+export function pollTriggers(
+  state: AttemptTriggerState,
+  nowMs: number,
+  idleThresholdMs: number = IDLE_THRESHOLD_MS,
+): TriggerEvaluation {
+  const evaluation = evaluateTriggers(state, nowMs, idleThresholdMs);
   if (evaluation.eligible && evaluation.kind !== null) {
     consumeTrigger(state, evaluation.kind);
   }

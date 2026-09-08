@@ -14,6 +14,73 @@ export interface ChatReasonerOptions {
 }
 
 /**
+ * Shared chat-completions transport for every CodeSense AI operation.
+ *
+ * Both the coaching evaluator (`HttpChatReasoner.evaluate`) and the Phase C
+ * problem classifier go through this function, so there is exactly one HTTP
+ * boundary: one header policy (never logs the key), one rate-limit capture,
+ * one envelope extractor. Transport problems throw; validation of the parsed
+ * JSON is always the caller's job, never the provider's.
+ */
+export async function postChatCompletions(
+  options: ChatReasonerOptions,
+  body: Record<string, unknown>,
+  opts: { signal?: AbortSignal },
+): Promise<unknown> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (options.apiKey.length > 0) {
+    headers.Authorization = `Bearer ${options.apiKey}`;
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${options.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    });
+  } catch (err) {
+    throw new Error(`AI provider unreachable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!response.ok) {
+    // Capture rate-limit metadata at the boundary; classification happens
+    // in the runner. Header lookup is case-insensitive per fetch spec.
+    let retryAfter: string | null = null;
+    try {
+      retryAfter = response.headers.get('Retry-After');
+    } catch {
+      retryAfter = null;
+    }
+    throw new HttpProviderError(response.status, `AI provider HTTP ${response.status}`, retryAfter);
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error('AI provider returned invalid JSON envelope');
+  }
+  return extractJsonContent(payload);
+}
+
+/**
+ * Typed HTTP failure from the chat-completions boundary. Carries the status
+ * code and the raw `Retry-After` header (if any) so the runner can classify
+ * rate limiting (HTTP 429) without the UI ever parsing provider specifics.
+ * The message contract is unchanged (`AI provider HTTP <status>`).
+ */
+export class HttpProviderError extends Error {
+  readonly status: number;
+  readonly retryAfter: string | null;
+
+  constructor(status: number, message: string, retryAfter: string | null) {
+    super(message);
+    this.name = 'HttpProviderError';
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+/**
  * OpenAI-compatible chat-completions reasoner (works with OpenAI and any
  * compatible local gateway). Uses global fetch — no new dependencies.
  * Transport problems throw; validation is the runner's job, not the
@@ -26,31 +93,11 @@ export class HttpChatReasoner implements AIReasoner {
   constructor(private readonly options: ChatReasonerOptions) {}
 
   async evaluate(context: AIContext, opts: { signal?: AbortSignal }): Promise<unknown> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (this.options.apiKey.length > 0) {
-      headers.Authorization = `Bearer ${this.options.apiKey}`;
-    }
-    let response: Response;
-    try {
-      response = await fetch(`${this.options.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(buildChatRequest(this.options.model, context)),
-        signal: opts.signal,
-      });
-    } catch (err) {
-      throw new Error(`AI provider unreachable: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    if (!response.ok) {
-      throw new Error(`AI provider HTTP ${response.status}`);
-    }
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new Error('AI provider returned invalid JSON envelope');
-    }
-    return extractJsonContent(payload);
+    return postChatCompletions(
+      this.options,
+      buildChatRequest(this.options.model, context),
+      opts,
+    );
   }
 }
 
@@ -128,6 +175,14 @@ export class FakeReasoner implements AIReasoner {
         confidence: null,
         relevantEvidence: [],
       },
+      diagnosis: {
+        observedEvidence: [],
+        hypothesis: '',
+        confidence: 'low',
+        unknowns: [],
+        recommendedInteraction: 'NONE',
+      },
+      requiresLearnerResponse: false,
     };
   }
 }

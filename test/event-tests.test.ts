@@ -224,6 +224,14 @@ describe('LocalSessionStore', () => {
 		const result = await store.deleteSession('nonexistent');
 		expect(result).to.be.false;
 	});
+
+	it('persists session data under the workspace .codesense directory', async () => {
+		const store = testStore();
+		await store.createSession(createCodingSession({ sessionId: 'ses_001', workspaceId: 'ws_test' }));
+		// Session/telemetry storage is rooted at the learner workspace and
+		// must stay there regardless of where AI configuration resolves from.
+		expect(fs.existsSync(path.join(TEST_STORAGE, '.codesense', 'sessions.json'))).to.be.true;
+	});
 });
 
 describe('Language identification', () => {

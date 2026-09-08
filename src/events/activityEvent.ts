@@ -236,7 +236,7 @@ export interface CheckpointCreatedPayload {
 export interface AiEvaluatedPayload {
   evaluationId: string;
   attemptId: string;
-  triggerKind: 'idle' | 'hard45' | 'manual';
+  triggerKind: 'idle' | 'hard45' | 'manual' | 'reply';
   shouldIntervene: boolean;
   interventionType: string;
 }

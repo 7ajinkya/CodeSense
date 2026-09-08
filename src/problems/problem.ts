@@ -9,6 +9,8 @@
  * authoritative external reference — no platform API dependency.
  */
 
+import type { ProblemClassification } from '../knowledge/classification';
+
 export const PROBLEM_EXTRACTION_VERSION = 1;
 
 /** Where the problem statement was extracted from (site identity). */
@@ -47,6 +49,16 @@ export interface Problem {
   provenance: ProblemProvenance;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Phase C cached classification (Problem → knowledge requirements).
+   * Optional for backward compatibility: problems created before Phase C
+   * simply lack it (unclassified) and stay fully usable. The canonical
+   * lookup is the ClassificationStore keyed by problemId; this field is a
+   * convenience copy attached via `attachClassificationToProblem`, which
+   * verifies the problemId match. Classification never affects usability
+   * (see `isUsableProblem`) and never requires learner input.
+   */
+  classification?: ProblemClassification | null;
 }
 
 /** Fields the learner may supply when scraping fails or is incomplete. */

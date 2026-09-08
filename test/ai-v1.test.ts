@@ -15,7 +15,7 @@ import {
   COACHING_SYSTEM_PROMPT,
   renderContextForPrompt,
 } from 'codesense/ai/aiPrompt';
-import { DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, loadWorkspaceEnvFile, readAiConfig } from 'codesense/ai/aiConfig';
+import { DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, loadEnvFile, readAiConfig } from 'codesense/ai/aiConfig';
 import {
   FakeReasoner,
   HttpChatReasoner,
@@ -73,6 +73,14 @@ function scriptedEvaluation(overrides: Partial<Record<string, unknown>> = {}): R
       confidence: 0.7,
       relevantEvidence: ['edit v3 changed loop bound', 'diagnostics: 0 errors'],
     },
+    diagnosis: {
+      observedEvidence: ['loop bound changed in edit v3 without an empty-input guard'],
+      hypothesis: 'The learner may not have considered the empty-input edge case.',
+      confidence: 'medium',
+      unknowns: ['Whether the learner knows the empty-input behavior is required'],
+      recommendedInteraction: 'SOCRATIC_QUESTION',
+    },
+    requiresLearnerResponse: true,
     ...overrides,
   };
 }
@@ -100,7 +108,7 @@ function fixtureContext(attemptId = 'att_ctx1'): AIContext {
 
 describe('AI prompt (versioned coaching instruction)', () => {
   it('pins a prompt version and states the core contract', () => {
-    expect(COACHING_PROMPT_VERSION).to.equal(2);
+    expect(COACHING_PROMPT_VERSION).to.equal(4);
     expect(COACHING_SYSTEM_PROMPT).to.contain('Socratic');
     expect(COACHING_SYSTEM_PROMPT).to.contain('shouldIntervene');
     expect(COACHING_SYSTEM_PROMPT).to.contain('chain-of-thought');
@@ -220,7 +228,7 @@ describe('AI configuration', () => {
     expect(config.timeoutMs).to.be.greaterThan(0);
   });
 
-  it('loads workspace .env values into readAiConfig', () => {
+  it('loads .env values from the given config directory into readAiConfig', () => {
     const dir = path.join(os.tmpdir(), 'codesense-test-dotenv-present');
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
@@ -236,7 +244,7 @@ describe('AI configuration', () => {
       delete process.env.CODESENSE_AI_BASE_URL;
       delete process.env.CODESENSE_AI_MODEL;
       delete process.env.CODESENSE_AI_TIMEOUT_MS;
-      loadWorkspaceEnvFile(dir);
+      loadEnvFile(dir);
       const config = readAiConfig();
       expect(config.enabled).to.be.true;
       expect(config.apiKey).to.equal('dotenv-test-key');
@@ -259,7 +267,7 @@ describe('AI configuration', () => {
     try {
       process.env.CODESENSE_AI_MODEL = 'explicit-model';
       delete process.env.CODESENSE_AI_TIMEOUT_MS;
-      loadWorkspaceEnvFile(dir);
+      loadEnvFile(dir);
       const config = readAiConfig();
       expect(config.model).to.equal('explicit-model');
       expect(config.timeoutMs).to.equal(7000);
@@ -275,8 +283,8 @@ describe('AI configuration', () => {
     try {
       delete process.env.CODESENSE_AI_API_KEY;
       delete process.env.CODESENSE_AI_BASE_URL;
-      loadWorkspaceEnvFile(dir);
-      loadWorkspaceEnvFile(undefined);
+      loadEnvFile(dir);
+      loadEnvFile(undefined);
       expect(process.env.CODESENSE_AI_API_KEY ?? '').to.equal('');
       expect(process.env.CODESENSE_AI_BASE_URL ?? '').to.equal('');
       expect(readAiConfig().enabled).to.be.false;
@@ -734,6 +742,100 @@ describe('hard45 mandatory check-in', () => {
     expect(outcome.displayed).to.be.false;
     expect(outcome.evaluation.interventionType).to.equal('NONE');
     expect(ports.appended).to.deep.equal([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conversational reply turns (kind 'reply' — never a fake trigger)
+// ---------------------------------------------------------------------------
+
+describe('Conversational reply turns', () => {
+  it('evaluates, displays, and persists a reply-turn intervention', async () => {
+    const ports = fakePorts();
+    const outcome = await runAiEvaluation(ports, {
+      attemptId: 'att_run',
+      triggerKind: 'reply',
+      reason: 'learner reply in sidebar conversation',
+    });
+    expect(outcome.status).to.equal('evaluated');
+    if (outcome.status !== 'evaluated') {
+      return;
+    }
+    expect(outcome.displayed).to.be.true;
+    expect(outcome.evaluation.triggerKind).to.equal('reply');
+    expect(outcome.evaluation.shouldIntervene).to.be.true;
+    expect(ports.saved.length).to.equal(1);
+    expect(ports.saved[0].triggerKind).to.equal('reply');
+    expect(ports.appended.length).to.equal(1);
+    expect(ports.appended[0].role).to.equal('coach');
+    expect(ports.appended[0].evaluationId).to.equal(ports.saved[0].evaluationId);
+  });
+
+  it('keeps a reply NONE silent instead of forcing a check-in', async () => {
+    const ports = fakePorts({ reasoner: new FakeReasoner() }); // defaults to NONE
+    const outcome = await runAiEvaluation(ports, {
+      attemptId: 'att_run',
+      triggerKind: 'reply',
+      reason: 'learner reply in sidebar conversation',
+    });
+    expect(outcome.status).to.equal('evaluated');
+    if (outcome.status !== 'evaluated') {
+      return;
+    }
+    // The hard45 ACK normalization must not leak into conversational turns.
+    expect(outcome.displayed).to.be.false;
+    expect(outcome.evaluation.interventionType).to.equal('NONE');
+    expect(ports.saved.length).to.equal(1);
+    expect(ports.appended).to.deep.equal([]);
+  });
+
+  it('failed reply evaluation preserves the already-submitted learner message', async () => {
+    const dir = tmpDir('codesense-test-reply-failure');
+    clean(dir);
+    try {
+      const store = new LocalAiStore(dir);
+      await store.appendConversation(learnerMessage('att_run', 'why does j start at 0?'));
+      const ports = fakePorts({
+        reasoner: new FakeReasoner([new Error('down')]),
+        saveEvaluation: (evaluation) => store.saveEvaluation(evaluation),
+        appendConversation: (message) => store.appendConversation(message),
+      });
+      const outcome = await runAiEvaluation(ports, {
+        attemptId: 'att_run',
+        triggerKind: 'reply',
+        reason: 'learner reply in sidebar conversation',
+      });
+      expect(outcome.status).to.equal('failed');
+      const mine = await store.listConversation('att_run');
+      expect(mine.map((m) => [m.role, m.text])).to.deep.equal([
+        ['learner', 'why does j start at 0?'],
+      ]);
+    } finally {
+      clean(dir);
+    }
+  });
+
+  it('sends prior conversation history to the reasoner on a reply turn', async () => {
+    const fake = new FakeReasoner([scriptedEvaluation()]);
+    const history = [
+      learnerMessage('att_run', 'I tried shrinking the window'),
+      coachMessage('att_run', 'What happens at the left edge?'),
+    ];
+    const ports = fakePorts({
+      reasoner: fake,
+      buildContext: async () => ({ ...fixtureContext('att_run'), conversation: history }),
+    });
+    const outcome = await runAiEvaluation(ports, {
+      attemptId: 'att_run',
+      triggerKind: 'reply',
+      reason: 'learner reply in sidebar conversation',
+    });
+    expect(outcome.status).to.equal('evaluated');
+    expect(fake.seen.length).to.equal(1);
+    expect(fake.seen[0].conversation.map((m) => m.text)).to.deep.equal([
+      'I tried shrinking the window',
+      'What happens at the left edge?',
+    ]);
   });
 });
 

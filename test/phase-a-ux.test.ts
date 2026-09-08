@@ -92,6 +92,14 @@ function scriptedEvaluation(overrides: Partial<Record<string, unknown>> = {}): R
       confidence: 0.7,
       relevantEvidence: ['edit v3 changed loop bound'],
     },
+    diagnosis: {
+      observedEvidence: ['loop bound changed without an empty-input guard'],
+      hypothesis: 'The learner may not have considered the empty-input edge case.',
+      confidence: 'medium',
+      unknowns: ['Whether the learner knows the empty-input behavior is required'],
+      recommendedInteraction: 'SOCRATIC_QUESTION',
+    },
+    requiresLearnerResponse: true,
     ...overrides,
   };
 }
@@ -295,10 +303,14 @@ describe('Phase A proactive notification (idle/hard45 interventions only)', () =
 
 describe('Phase A idle suppression (unresolved question defers idle only)', () => {
   it('suppresses only when the latest coach intervention asks a question', () => {
-    const question = validatedEvaluation('att_s', 'idle', { interventionType: 'SOCRATIC_QUESTION' });
+    const question = validatedEvaluation('att_s', 'idle', {
+      interventionType: 'SOCRATIC_QUESTION',
+      requiresLearnerResponse: true,
+    });
     const hint = validatedEvaluation('att_s', 'idle', {
       interventionType: 'HINT',
       message: 'Try a hash map.',
+      requiresLearnerResponse: false,
     });
     const conversation: AIConversationMessage[] = [
       coachMessage('att_s', 'What happens on empty input?', {

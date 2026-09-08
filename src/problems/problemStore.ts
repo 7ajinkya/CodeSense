@@ -1,4 +1,5 @@
 import { Problem } from './problem';
+import { parseProblemClassification } from '../knowledge/classification';
 import { asOptionalString, isRecord, loadJsonArray, saveJsonArray } from '../persistence/storeFiles';
 
 const PROBLEMS_FILE = 'problems.json';
@@ -38,6 +39,11 @@ function parseProblem(raw: unknown): Problem | null {
     : [];
   const topicsRaw: unknown = raw.topics;
   const topics = Array.isArray(topicsRaw) ? topicsRaw.filter((t): t is string => typeof t === 'string') : [];
+  // Phase C: round-trip a cached classification when present and sound.
+  // Pre-Phase-C records lack the field (unclassified); malformed copies are
+  // dropped so loading never crashes — the canonical record lives in the
+  // ClassificationStore keyed by problemId either way.
+  const classification = parseProblemClassification(raw.classification);
   return {
     problemId: raw.problemId,
     provider: typeof raw.provider === 'string' ? (raw.provider as Problem['provider']) : 'unknown',
@@ -57,6 +63,7 @@ function parseProblem(raw: unknown): Problem | null {
     },
     createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : new Date(0).toISOString(),
     updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date(0).toISOString(),
+    ...(classification !== null ? { classification } : {}),
   };
 }
 

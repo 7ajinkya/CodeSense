@@ -5,6 +5,8 @@ import { computeLineDiff, formatTextDiff } from '../history/textDiff';
 import { ActivityEvent } from '../events/activityEvent';
 import { Problem } from '../problems/problem';
 import { AIConversationMessage } from '../ai/aiTypes';
+import { ProblemClassification } from '../knowledge/classification';
+import type { CoachContext } from '../coach/coachTypes';
 
 export const AI_CONTEXT_VERSION = 2;
 export const MAX_RECENT_EDITS = 100;
@@ -40,6 +42,13 @@ export interface AIContextProblem {
   topics: string[];
   source: string;
   sourceUrl: string;
+  /**
+   * Phase C structured knowledge for this problem (what the problem
+   * exercises — NOT learner ability; mastery/weakness never appears here).
+   * Absent when the problem is unclassified; the coach then works from the
+   * statement alone, exactly as before Phase C.
+   */
+  classification?: ProblemClassification | null;
 }
 
 export interface AIContextAttemptSummary {
@@ -130,6 +139,13 @@ export interface AIContext {
   executions: AIContextExecution[];
   conversation: AIConversationMessage[];
   learnerContext: LearnerContext;
+  /**
+   * Phase E deterministic coaching briefing (learner-aware slice +
+   * previous-intervention situation). Optional: absent when the coach
+   * layer has nothing to add, keeping contexts byte-identical to
+   * pre-Phase-E. Never raw history — see coachContext caps.
+   */
+  coachBriefing?: CoachContext | null;
 }
 
 export interface BuildAIContextArgs {
@@ -145,6 +161,10 @@ export interface BuildAIContextArgs {
   /** Prior coach/learner exchanges for this attempt (oldest-first). */
   conversation?: AIConversationMessage[];
   learnerContext?: LearnerContext;
+  /** Phase C classification for the problem (absent = unclassified). */
+  classification?: ProblemClassification | null;
+  /** Phase E coaching briefing (absent = coach from base context alone). */
+  coachBriefing?: CoachContext | null;
   now?: string;
 }
 
@@ -306,6 +326,9 @@ export function buildAIContext(args: BuildAIContextArgs): AIContext {
       topics: problem.topics,
       source: problem.provenance.source,
       sourceUrl: problem.provenance.sourceUrl,
+      // Conditional spread keeps pre-Phase-C contexts byte-identical when no
+      // classification is supplied (existing prompt snapshots unaffected).
+      ...(args.classification ? { classification: args.classification } : {}),
     },
     attempt: {
       attemptId: attempt.attemptId,
@@ -338,5 +361,8 @@ export function buildAIContext(args: BuildAIContextArgs): AIContext {
     executions: extractExecutionEvidence(args.sessionEvents),
     conversation,
     learnerContext: args.learnerContext ?? { notes: [] },
+    // Conditional spread keeps pre-Phase-E contexts byte-identical when no
+    // briefing is supplied (existing prompt snapshots unaffected).
+    ...(args.coachBriefing ? { coachBriefing: args.coachBriefing } : {}),
   };
 }
