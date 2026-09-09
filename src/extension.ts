@@ -70,7 +70,7 @@ import { loadEnvFile, readAiConfig } from './ai/aiConfig';
 import { EvaluationOutcome, runAiEvaluation, shouldNotifyProactiveIntervention } from './ai/evaluationRunner';
 import { resolveUIFontSize } from './ui/fontSize';
 import { isAwaitingLearnerResponse } from './ai/conversationStatus';
-import { releaseEvaluation, tryReserveEvaluation } from './ai/evaluationGuard';
+import { nextCheckinStatus, releaseEvaluation, resetCheckinStatusOnAttemptBoundary, tryReserveEvaluation } from './ai/evaluationGuard';
 import { resolveRateLimitCooldownMs } from './ai/rateLimit';
 import { buildAIContext } from './context/aiContext';
 import { editRecordsFromEvents, selectAttemptEdits } from './history/codeHistory';
@@ -105,17 +105,20 @@ import type { CoachContext } from './coach/coachTypes';
 // never automatic activation without a learner decision).
 import { LocalGoalStore } from './goals/goalStore';
 import { detectLearningNeeds } from './goals/needDetection';
-import { explainProposal, proposeGoalFromNeed, proposeGoalFromRequest } from './goals/goalProposal';
+import { explainProposal, proposeGoalFromRequest } from './goals/goalProposal';
 import { acceptGoal, modifyGoal, rejectGoal, resumeGoal, pauseGoal, completeGoal, abandonGoal } from './goals/goalLifecycle';
 import {
   findConflictingGoal,
   getActiveGoals,
   getProposals,
-  proposalFingerprint,
-  shouldSuppressProposal,
   summarizeGoalsForPrompt,
 } from './goals/goalQueries';
 import type { LearningGoal } from './goals/goalTypes';
+// F1 proposal-lifecycle hardening: freshness/provenance predicates and the
+// serialized post-problem proposal chain (stale pendings neither suppress
+// nor block; surfacing is display-time validated with provenance).
+import { formatProvenanceLine, isProposalFresh, resolveProposalProvenance } from './goals/goalFreshness';
+import { proposeGoalForAttemptEnd } from './goals/goalChain';
 // Phase F2 imports (targeted practice planning: deterministic selection of
 // an existing problem serving an active goal, durable plan lifecycle,
 // fail-open learner-facing surfacing; never generates problems, never
@@ -691,6 +694,10 @@ async function handleProblemStart(input: StartInput): Promise<{ ok: true } | { o
   });
   touchActivity();
   await createSnapshotCheckpoint('start');
+  // A new attempt starts with neutral transient check-in status: a leftover
+  // evaluating/error state from a previous attempt must not leak into this
+  // panel (message history stays gated by attempt as before).
+  aiPanel = { ...aiPanel, status: resetCheckinStatusOnAttemptBoundary(aiPanel.status) };
   refreshStatusBar();
   updateSidebar();
   void vscode.window.showInformationMessage(
@@ -833,16 +840,21 @@ async function endProblem(): Promise<Attempt | null> {
   // learner activates nothing implicitly (see maybeProposeGoalAfterProblemEnd).
   // Phase F3 chains after it (which awaits a D sync first), so progress
   // evaluation reads finalized evidence without adding new D writes.
-  void maybeProposeGoalAfterProblemEnd(attempt, problem).then(
-    () => maybeEvaluateProgressAfterProblemEnd(attempt),
-    (err: unknown) => {
-      console.error('CodeSense: background goal chain failed', err);
-    },
-  );
+  void maybeProposeGoalAfterProblemEnd(attempt, problem)
+    .then(
+      () => maybeEvaluateProgressAfterProblemEnd(attempt),
+      (err: unknown) => {
+        console.error('CodeSense: background goal chain failed', err);
+      },
+    );
   // Ending a problem resets the trigger lifecycle (§32): drop per-attempt state.
   activeAttempt = null;
   activeProblem = null;
   activeTrigger = null;
+  // Retire transient check-in status with the attempt: a leftover
+  // evaluating/error state belongs to the ended attempt, not to the empty
+  // panel (message history stays gated by attempt as before).
+  aiPanel = { ...aiPanel, status: resetCheckinStatusOnAttemptBoundary(aiPanel.status) };
   refreshStatusBar();
   updateSidebar();
   void vscode.window.showInformationMessage(
@@ -1168,6 +1180,12 @@ async function maybeRunAiEvaluation(
       },
       { attemptId: attempt.attemptId, triggerKind: kind, reason },
     );
+    // Recency gate for panel STATUS (message content already has the
+    // `displayed` guard below): only the currently visible attempt may
+    // move the check-in status, so a slow completion landing after the
+    // learner moved on can never plant or clear a banner for another
+    // context. Every completion stays in logs + persisted history.
+    const completionVisible = (activeAttempt?.attemptId ?? null) === attempt.attemptId;
     if (outcome.status === 'evaluated') {
       const evaluation = outcome.evaluation;
       // A completed evaluation proves the provider is answering again, so a
@@ -1228,11 +1246,11 @@ async function maybeRunAiEvaluation(
         }
       })();
       if (outcome.displayed) {
-        aiPanel = { status: 'idle', lastMessage: evaluation.message, lastAttemptId: evaluation.attemptId, exchange: aiPanel.exchange };
+        aiPanel = { status: nextCheckinStatus(aiPanel.status, 'evaluated-displayed', completionVisible), lastMessage: evaluation.message, lastAttemptId: evaluation.attemptId, exchange: aiPanel.exchange };
       } else {
         // Evaluated fine, but the learner moved on: persist (done above),
         // never display inside the new attempt. Panel keeps prior state.
-        aiPanel = { status: 'idle', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
+        aiPanel = { status: nextCheckinStatus(aiPanel.status, 'evaluated-silent', completionVisible), lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
       }
       // Phase A proactive notification: a subtle native nudge ONLY when a
       // trigger-driven (idle/hard45) evaluation produced a learner-facing
@@ -1246,7 +1264,7 @@ async function maybeRunAiEvaluation(
       }
     } else if (outcome.status === 'failed') {
       console.error(`CodeSense: AI evaluation failed (${outcome.reason}): ${outcome.detail}`);
-      aiPanel = { status: 'error', lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
+      aiPanel = { status: nextCheckinStatus(aiPanel.status, 'failed', completionVisible), lastMessage: aiPanel.lastMessage, lastAttemptId: aiPanel.lastAttemptId, exchange: aiPanel.exchange };
       if (outcome.reason === 'rate-limited') {
         // Confirmed provider rate limit (HTTP 429): enter the local UI
         // cooldown — sidebar shows a countdown and disables Send until it
@@ -1366,41 +1384,27 @@ async function maybeSyncEvaluationToLearnerModel(
 
 /**
  * Runs the End Problem goal chain in the background: await the attempt
- * sync so detection reads the fresh profile, derive candidate needs,
- * persist the first non-conflicting, non-suppressed proposal, and surface
- * it once. Never throws; every failure degrades to silence.
+ * sync so detection reads the fresh profile, then run the serialized
+ * proposal chain (single-flight across overlapping problem ends, stale
+ * pendings neither suppress nor block), and surface at most one fresh
+ * proposal. Never throws; every failure degrades to silence.
  */
 async function maybeProposeGoalAfterProblemEnd(attempt: Attempt, problem: Problem): Promise<void> {
   try {
     await maybeSyncAttemptToLearnerModel(attempt, problem);
-    const [profile, goals] = await Promise.all([
-      activeLearnerModelStore().loadProfile().catch(() => null),
-      activeGoalStore().listGoals().catch(() => []),
-    ]);
-    if (!profile) {
-      return;
+    const result = await proposeGoalForAttemptEnd({
+      goalStore: activeGoalStore(),
+      modelStore: activeLearnerModelStore(),
+      graph: getDefaultKnowledgeGraph(),
+      nowIso: () => new Date().toISOString(),
+    });
+    if (result.action === 'proposed') {
+      void surfaceGoalProposal(result.proposal.goalId);
+    } else if (result.action === 'none' && result.reason === 'error') {
+      console.error('CodeSense: background goal proposal failed');
     }
-    if (goals.some((g) => g.status === 'proposed')) {
-      return;
-    }
-    const now = new Date().toISOString();
-    const needs = detectLearningNeeds({ profile, graph: getDefaultKnowledgeGraph(), now, limit: 3 });
-    for (const need of needs) {
-      const proposal = proposeGoalFromNeed(need, { graph: getDefaultKnowledgeGraph(), now });
-      if (!proposal) {
-        continue;
-      }
-      if (findConflictingGoal(goals, proposal.targetKey)) {
-        continue;
-      }
-      const fingerprint = proposalFingerprint(proposal.evidenceBasis.evidenceIds, profile.updatedAt);
-      if (shouldSuppressProposal(goals, proposal.targetKey, fingerprint)) {
-        continue;
-      }
-      await activeGoalStore().upsertGoal(proposal);
-      void surfaceGoalProposal(proposal.goalId);
-      return;
-    }
+    // suppressed-pending: the fresh pending proposal stays discoverable via
+    // review; no second popup (anti-nag).
   } catch (err) {
     console.error('CodeSense: background goal proposal failed', err);
   }
@@ -1415,20 +1419,42 @@ async function surfaceGoalProposal(goalId: string): Promise<void> {
       return;
     }
     const graph = getDefaultKnowledgeGraph();
-    const profile = await activeLearnerModelStore().loadProfile().catch(() => null);
-    const evidence = await activeLearnerEvidenceStore().listEvidence().catch(() => []);
-    let detail = proposal.description;
-    if (profile) {
-      const need = detectLearningNeeds({ profile, graph, now: new Date().toISOString(), limit: 10 }).find(
-        (candidate) => candidate.needId === proposal.evidenceBasis.needId,
+    const [profile, evidence, problems] = await Promise.all([
+      activeLearnerModelStore().loadProfile().catch(() => null),
+      activeLearnerEvidenceStore().listEvidence().catch(() => []),
+      activeProblemStore().listProblems().catch(() => []),
+    ]);
+    const needs =
+      profile !== null
+        ? detectLearningNeeds({ profile, graph, now: new Date().toISOString(), limit: 10 })
+        : [];
+    // Display-time validation: never present a stale suggestion as current
+    // advice. Learner-owned requests (no need) are always presentable.
+    if (!isProposalFresh(proposal, needs)) {
+      console.log(
+        `CodeSense: skipping stale goal suggestion ${proposal.goalId} (its need no longer detects).`,
       );
-      if (need) {
-        const explanation = explainProposal(need, evidence, graph);
-        detail = `${proposal.description}\n${explanation.summary}`;
-        if (explanation.uncertainty) {
-          detail += `\n${explanation.uncertainty}`;
-        }
+      return;
+    }
+    let detail = proposal.description;
+    const need = needs.find((candidate) => candidate.needId === proposal.evidenceBasis.needId) ?? null;
+    if (profile && need) {
+      const explanation = explainProposal(need, evidence, graph);
+      detail = `${proposal.description}\n${explanation.summary}`;
+      if (explanation.uncertainty) {
+        detail += `\n${explanation.uncertainty}`;
       }
+    }
+    // Provenance: every surfaced suggestion says what it is based on, so a
+    // previous attempt's suggestion can never read as the current one.
+    const provenance = resolveProposalProvenance(proposal, evidence);
+    const titles = new Map(problems.map((problem) => [problem.problemId, problem.title] as const));
+    const provenanceLine = formatProvenanceLine(proposal, provenance, (problemId) => {
+      const title = titles.get(problemId) ?? null;
+      return typeof title === 'string' ? title : null;
+    });
+    if (provenanceLine !== null) {
+      detail += `\n${provenanceLine}`;
     }
     const pick = await vscode.window.showInformationMessage(
       `CodeSense learning goal suggestion:\n${detail}`,
@@ -1501,6 +1527,37 @@ async function reviewLearningGoals(): Promise<void> {
       action: string;
       goalId?: string;
     }
+    // Provenance for pending proposals (best-effort; review stays usable
+    // without it). Stale pendings are annotated, never hidden — the
+    // learner still owns the decision.
+    const [reviewProfile, reviewEvidence, reviewProblems] = await Promise.all([
+      activeLearnerModelStore().loadProfile().catch(() => null),
+      activeLearnerEvidenceStore().listEvidence().catch(() => []),
+      activeProblemStore().listProblems().catch(() => []),
+    ]);
+    const reviewNeeds =
+      reviewProfile !== null
+        ? detectLearningNeeds({
+            profile: reviewProfile,
+            graph: getDefaultKnowledgeGraph(),
+            now: new Date().toISOString(),
+            limit: 10,
+          })
+        : [];
+    const reviewTitles = new Map(
+      reviewProblems.map((problem) => [problem.problemId, problem.title] as const),
+    );
+    const proposalSuffix = (goal: LearningGoal): string => {
+      if (!isProposalFresh(goal, reviewNeeds)) {
+        return 'awaiting your decision · based on earlier evidence';
+      }
+      const line = formatProvenanceLine(
+        goal,
+        resolveProposalProvenance(goal, reviewEvidence),
+        (problemId) => reviewTitles.get(problemId) ?? null,
+      );
+      return line !== null ? `awaiting your decision · ${line}` : 'awaiting your decision';
+    };
     const choices: GoalChoice[] = [];
     for (const goal of goals.filter((g) => g.status === 'active' || g.status === 'paused')) {
       choices.push({
@@ -1513,7 +1570,7 @@ async function reviewLearningGoals(): Promise<void> {
     for (const goal of goals.filter((g) => g.status === 'proposed')) {
       choices.push({
         label: `$(question) Proposed: ${goal.description}`,
-        description: 'awaiting your decision',
+        description: proposalSuffix(goal),
         action: 'decide',
         goalId: goal.goalId,
       });
