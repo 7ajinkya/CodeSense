@@ -23,6 +23,7 @@
     "onCommand:codesense.evaluateNow",
     "onCommand:codesense.reviewLearningGoals",
     "onCommand:codesense.suggestNextActivity",
+    "onCommand:codesense.reflectOnLastAttempt",
     "onView:codesense.sidebar"
   ],
   "main": "./out/extension.js",
@@ -81,6 +82,10 @@
       {
         "command": "codesense.suggestNextActivity",
         "title": "CodeSense: Suggest Next Practice Activity"
+      },
+      {
+        "command": "codesense.reflectOnLastAttempt",
+        "title": "CodeSense: Reflect on Last Attempt"
       },
       {
         "command": "codesense.showMenu",

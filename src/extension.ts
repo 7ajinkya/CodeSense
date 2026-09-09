@@ -135,6 +135,28 @@ import { getActivePlansForGoal, summarizePlanForLearner } from './practice/activ
 import { LocalProgressStore } from './progress/progressStore';
 import { evaluateActivityProgress } from './progress/progressEvaluation';
 import { summarizeProgressForLearner } from './progress/progressQueries';
+// Phase G imports (structured reflection: explicit learner-owned input
+// about a completed attempt, durable reflection records, deterministic
+// mapping into D `human-curated` evidence via D's own validators and
+// `syncRecordsToLearnerModel`. G never folds models, never proposes goals,
+// never scrapes conversation; the deterministic path works without AI).
+import { LocalReflectionStore } from './reflection/reflectionStore';
+import {
+  dismissReflectionOffer,
+  offerReflectionForAttemptEnd,
+  submitReflectionResponse,
+} from './reflection/reflectionChain';
+import {
+  REFLECTION_CATEGORIES,
+  REFLECTION_CATEGORY_LABELS,
+  ReflectionCategory,
+  isKnownReflectionCategory,
+} from './reflection/reflectionTypes';
+import type { ReflectionInterpretation } from './reflection/reflectionTypes';
+import {
+  HttpReflectionStructuringReasoner,
+  proposeReflectionInterpretation,
+} from './reflection/reflectionPrompt';
 
 /**
  * Phase 0 activity capture: observe document / editor / diagnostics /
@@ -231,6 +253,10 @@ let activityPlanStore: LocalActivityPlanStore | null = null;
 // evaluated activity, chronological per goal). Same local-first store
 // pattern; progress survives restart/session/problem boundaries.
 let progressStore: LocalProgressStore | null = null;
+// Phase G state: durable structured-reflection records (one per finalized
+// attempt, keyed refl_<attemptId>). Same local-first store pattern;
+// reflections survive restart/session/problem boundaries.
+let reflectionStore: LocalReflectionStore | null = null;
 // Phase E state: secret-free AI interaction trace ring (debug aid only,
 // never learner evidence, never uploaded anywhere).
 let aiTraceStore: LocalAiTraceStore | null = null;
@@ -339,6 +365,13 @@ function activeProgressStore(): LocalProgressStore {
   return progressStore;
 }
 
+function activeReflectionStore(): LocalReflectionStore {
+  if (!reflectionStore) {
+    reflectionStore = new LocalReflectionStore(workspaceFsPath());
+  }
+  return reflectionStore;
+}
+
 function rebindStores(): void {
   const wsPath = workspaceFsPath();
   store = new LocalSessionStore(wsPath);
@@ -353,6 +386,7 @@ function rebindStores(): void {
   goalStore = new LocalGoalStore(wsPath);
   activityPlanStore = new LocalActivityPlanStore(wsPath);
   progressStore = new LocalProgressStore(wsPath);
+  reflectionStore = new LocalReflectionStore(wsPath);
 }
 
 function getHistoryChannel(): vscode.OutputChannel {
@@ -846,6 +880,12 @@ async function endProblem(): Promise<Attempt | null> {
       (err: unknown) => {
         console.error('CodeSense: background goal chain failed', err);
       },
+    )
+    .then(
+      () => maybeOfferReflectionAfterProblemEnd(attempt, problem),
+      (err: unknown) => {
+        console.error('CodeSense: background reflection offer failed', err);
+      },
     );
   // Ending a problem resets the trigger lifecycle (§32): drop per-attempt state.
   activeAttempt = null;
@@ -937,6 +977,7 @@ async function showMenu(): Promise<void> {
   choices.push({ label: '$(history) Show Problem History', action: 'history' });
   choices.push({ label: '$(target) Review Learning Goals', action: 'goals' });
   choices.push({ label: '$(zap) Suggest Next Practice Activity', action: 'practice' });
+  choices.push({ label: '$(comment) Reflect on Last Attempt', action: 'reflect' });
   choices.push({ label: '$(list-unordered) Show Session Timeline', action: 'timeline' });
   choices.push({ label: '$(file) Show Session Data Location', action: 'location' });
   const picked = await vscode.window.showQuickPick(choices, { placeHolder: 'CodeSense' });
@@ -967,6 +1008,9 @@ async function showMenu(): Promise<void> {
       break;
     case 'practice':
       void suggestNextActivityFlow();
+      break;
+    case 'reflect':
+      void reflectOnLastAttempt();
       break;
     case 'timeline':
       void showTimeline();
@@ -1991,6 +2035,221 @@ async function maybeEvaluateProgressAfterProblemEnd(attempt: Attempt): Promise<v
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase G: structured reflection (background offer + brief native-modal
+// response flow; deterministic, fail-open, never triggers F1/F2/F3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Offers a reflection opportunity for a finalized attempt, chained AFTER
+ * F1 + F3 in `endProblem` so progress reads finalized evidence without
+ * reflection in it. Provenance comes from the finalized attempt/problem
+ * objects (never live globals). Never throws; never proposes goals.
+ */
+async function maybeOfferReflectionAfterProblemEnd(
+  attempt: Attempt,
+  problem: Problem,
+): Promise<void> {
+  try {
+    let classificationStatus: 'classified' | 'partial' | 'unclassified' = 'unclassified';
+    try {
+      const classification =
+        problem.classification ??
+        (await activeClassificationStore().getClassification(problem.problemId).catch(() => null));
+      classificationStatus = classification ? getClassificationStatus(classification) : 'unclassified';
+    } catch {
+      classificationStatus = 'unclassified';
+    }
+    // Best-effort context snapshot (display only; nulls are fine).
+    let goalId: string | null = null;
+    try {
+      const goals = await activeGoalStore().listGoals().catch(() => []);
+      goalId = getActiveGoals(goals)[0]?.goalId ?? null;
+    } catch {
+      goalId = null;
+    }
+    const result = await offerReflectionForAttemptEnd(
+      { reflectionStore: activeReflectionStore(), nowIso: () => new Date().toISOString() },
+      { attempt, problem, classificationStatus, goalId },
+    );
+    if (result.action === 'offered' || result.action === 'already-exists') {
+      if (result.reflection.status === 'offered') {
+        void surfaceReflectionPrompt(result.reflection.provenance.attemptId);
+      }
+    }
+  } catch (err) {
+    console.error('CodeSense: background reflection offer failed', err);
+  }
+}
+
+/**
+ * Presents one pending reflection: info prompt → category quick-pick →
+ * optional free-text input → deterministic submit. Display-time validated
+ * against the stored row (stale callbacks abort silently). Esc/cancel at
+ * the category step leaves the offer pending (resumable via command);
+ * cancel at the text step keeps the category. "Not now" dismisses.
+ */
+async function surfaceReflectionPrompt(attemptId: string): Promise<void> {
+  try {
+    const store = activeReflectionStore();
+    const pending = await store.getReflectionForAttempt(attemptId).catch(() => null);
+    if (!pending || pending.status !== 'offered') {
+      return;
+    }
+    if (pending.provenance.attemptId !== attemptId) {
+      return;
+    }
+    const [problem, attempt] = await Promise.all([
+      activeProblemStore().getProblem(pending.provenance.problemId).catch(() => null),
+      activeAttemptStore().getAttempt(attemptId).catch(() => null),
+    ]);
+    const title =
+      pending.provenance.problemTitle ?? problem?.title ?? pending.provenance.problemId;
+    const state = attempt?.currentState ?? 'completed';
+    const pick = await vscode.window.showInformationMessage(
+      `CodeSense: quick reflection on "${title}" (ended ${state})?`,
+      'Reflect',
+      'Not now',
+    );
+    if (pick !== 'Reflect') {
+      if (pick === 'Not now') {
+        await dismissReflectionOffer(
+          { reflectionStore: activeReflectionStore(), nowIso: () => new Date().toISOString() },
+          attemptId,
+        ).catch(() => null);
+      }
+      return;
+    }
+    // Re-validate before each step: the row may have settled while the
+    // learner was reading.
+    const fresh = await store.getReflectionForAttempt(attemptId).catch(() => null);
+    if (!fresh || fresh.status !== 'offered' || fresh.provenance.attemptId !== attemptId) {
+      return;
+    }
+    interface ReflectionChoice extends vscode.QuickPickItem {
+      category: ReflectionCategory;
+    }
+    const choices: ReflectionChoice[] = REFLECTION_CATEGORIES.map((category) => ({
+      label: REFLECTION_CATEGORY_LABELS[category],
+      category,
+    }));
+    const chosen = await vscode.window.showQuickPick(choices, {
+      placeHolder: `What best describes "${title}"?`,
+    });
+    if (!chosen || !isKnownReflectionCategory(chosen.category)) {
+      return;
+    }
+    const text = await vscode.window.showInputBox({
+      prompt: 'What did you learn or notice? (optional)',
+      validateInput: (value) =>
+        value.length > 500 ? 'Keep it under 500 characters.' : null,
+    });
+    // Input-box cancel (undefined) keeps the category; only an explicit
+    // empty string means "no text".
+    const freeText = text === undefined ? null : text;
+    // Optional AI structuring (G6 enhancement only): propose a narrowed
+    // reading of explicit free text. Fail-open to the deterministic path;
+    // the proposal is display-only until the learner confirms it here.
+    let confirmedInterpretation: ReflectionInterpretation | null = null;
+    if (freeText && freeText.trim().length > 0) {
+      try {
+        const aiConfig = readAiConfig();
+        if (aiConfig.enabled) {
+          const outcome = await proposeReflectionInterpretation(
+            {
+              reasoner: new HttpReflectionStructuringReasoner({
+                baseUrl: aiConfig.baseUrl,
+                apiKey: aiConfig.apiKey,
+                model: aiConfig.model,
+              }),
+              graph: getDefaultKnowledgeGraph(),
+              model: aiConfig.model,
+            },
+            { category: chosen.category, freeText, problemTitle: title },
+          );
+          if (outcome.status === 'proposed') {
+            const detail =
+              `${outcome.candidate.evidenceType} / ${outcome.candidate.dimension} / ` +
+              `${outcome.candidate.entityIds.join(', ')}` +
+              `${outcome.candidate.mistakeCategory ? ` / ${outcome.candidate.mistakeCategory}` : ''}`;
+            const confirm = await vscode.window.showInformationMessage(
+              `Potential structured interpretation: ${detail}`,
+              'Looks right',
+              'Keep my words only',
+            );
+            if (confirm === 'Looks right') {
+              confirmedInterpretation = {
+                entityIds: outcome.candidate.entityIds,
+                dimension: outcome.candidate.dimension,
+                evidenceType: outcome.candidate.evidenceType,
+                ...(outcome.candidate.mistakeCategory
+                  ? { mistakeCategory: outcome.candidate.mistakeCategory }
+                  : {}),
+                confidence: outcome.candidate.confidence,
+                aiAssisted: true,
+                learnerConfirmed: true,
+              };
+            }
+          }
+        }
+      } catch {
+        confirmedInterpretation = null;
+      }
+    }
+    const [submitAttempt, submitProblem, classification] = await Promise.all([
+      activeAttemptStore().getAttempt(attemptId).catch(() => null),
+      activeProblemStore()
+        .getProblem(pending.provenance.problemId)
+        .catch(() => null),
+      activeClassificationStore().getClassification(pending.provenance.problemId).catch(() => null),
+    ]);
+    if (!submitAttempt || !submitProblem) {
+      return;
+    }
+    const outcome = await submitReflectionResponse(
+      {
+        reflectionStore: activeReflectionStore(),
+        evidenceStore: activeLearnerEvidenceStore(),
+        modelStore: activeLearnerModelStore(),
+        graph: getDefaultKnowledgeGraph(),
+        nowIso: () => new Date().toISOString(),
+      },
+      {
+        attempt: submitAttempt,
+        problem: submitProblem,
+        classification: submitProblem.classification ?? classification,
+        category: chosen.category,
+        freeText,
+        interpretation: confirmedInterpretation,
+      },
+    );
+    if (outcome.action === 'emitted') {
+      void vscode.window.showInformationMessage('CodeSense: reflection saved. Thank you.');
+    } else if (outcome.action === 'validated-no-evidence') {
+      void vscode.window.showInformationMessage('CodeSense: reflection saved (your words kept).');
+    }
+  } catch (err) {
+    console.error('CodeSense: reflection prompt failed', err);
+  }
+}
+
+/** Re-surfaces the most recent pending reflection (reload/delayed path). */
+async function reflectOnLastAttempt(): Promise<void> {
+  try {
+    const reflections = await activeReflectionStore().listReflections().catch(() => []);
+    const pending = reflections
+      .filter((r) => r.status === 'offered')
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.reflectionId.localeCompare(a.reflectionId));
+    if (pending.length === 0 || !pending[0]) {
+      void vscode.window.showInformationMessage('CodeSense: no pending reflections.');
+      return;
+    }
+    await surfaceReflectionPrompt(pending[0].provenance.attemptId);
+  } catch (err) {
+    console.error('CodeSense: reflect-on-last-attempt failed', err);
+  }
+}
+
 /** Phase D: bounded learner-model digest for the coach context (fail-open). */
 async function loadLearnerNotes(): Promise<string[]> {
   try {
@@ -2391,6 +2650,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const suggestPracticeDisposable = vscode.commands.registerCommand('codesense.suggestNextActivity', () => {
     void suggestNextActivityFlow();
   });
+  const reflectDisposable = vscode.commands.registerCommand('codesense.reflectOnLastAttempt', () => {
+    void reflectOnLastAttempt();
+  });
   const menuDisposable = vscode.commands.registerCommand('codesense.showMenu', () => {
     void showMenu();
   });
@@ -2694,6 +2956,7 @@ export function activate(context: vscode.ExtensionContext): void {
     evaluateNowDisposable,
     reviewGoalsDisposable,
     suggestPracticeDisposable,
+    reflectDisposable,
     menuDisposable,
     timelineDisposable,
     locationDisposable,
