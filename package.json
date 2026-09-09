@@ -24,6 +24,11 @@
     "onCommand:codesense.reviewLearningGoals",
     "onCommand:codesense.suggestNextActivity",
     "onCommand:codesense.reflectOnLastAttempt",
+    "onCommand:codesense.showLearningHistory",
+    "onCommand:codesense.searchLearningHistory",
+    "onCommand:codesense.showGoalProgress",
+    "onCommand:codesense.showConceptHistory",
+    "onCommand:codesense.exportLearningHistory",
     "onView:codesense.sidebar"
   ],
   "main": "./out/extension.js",
@@ -86,6 +91,26 @@
       {
         "command": "codesense.reflectOnLastAttempt",
         "title": "CodeSense: Reflect on Last Attempt"
+      },
+      {
+        "command": "codesense.showLearningHistory",
+        "title": "CodeSense: Show Learning History"
+      },
+      {
+        "command": "codesense.searchLearningHistory",
+        "title": "CodeSense: Search Learning History"
+      },
+      {
+        "command": "codesense.showGoalProgress",
+        "title": "CodeSense: Show Goal Progress"
+      },
+      {
+        "command": "codesense.showConceptHistory",
+        "title": "CodeSense: Show Concept History"
+      },
+      {
+        "command": "codesense.exportLearningHistory",
+        "title": "CodeSense: Export Learning History"
       },
       {
         "command": "codesense.showMenu",

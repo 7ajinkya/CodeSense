@@ -157,6 +157,18 @@ import {
   HttpReflectionStructuringReasoner,
   proposeReflectionInterpretation,
 } from './reflection/reflectionPrompt';
+// Phase H imports (learning analytics: read-only deterministic queries over
+// frozen C–G history. No analytics store, no second learner model, no AI,
+// no C/D/E/F/G mutations — loads via existing Local*Stores only).
+import { LocalAnalyticsSource, loadAnalyticsSnapshot } from './analytics/analyticsSource';
+import type { AnalyticsSnapshot } from './analytics/analyticsTypes';
+import {
+  renderEntityHistory,
+  renderGoalProgress,
+  renderLearningHistory,
+  searchLearningHistory,
+} from './analytics/analyticsRender';
+import { exportAnalyticsJson, exportAnalyticsMarkdown } from './analytics/analyticsExport';
 
 /**
  * Phase 0 activity capture: observe document / editor / diagnostics /
@@ -396,6 +408,188 @@ function getHistoryChannel(): vscode.OutputChannel {
   return historyChannel;
 }
 
+let analyticsChannel: vscode.OutputChannel | null = null;
+
+function getAnalyticsChannel(): vscode.OutputChannel {
+  if (!analyticsChannel) {
+    analyticsChannel = vscode.window.createOutputChannel('CodeSense Learning History');
+  }
+  return analyticsChannel;
+}
+
+/**
+ * Phase H: load a read-only analytics snapshot via existing stores.
+ * Fail-open: per-store failures degrade to empty legs with warnings.
+ */
+async function loadAnalyticsSnapshotForWorkspace(): Promise<AnalyticsSnapshot> {
+  const source = new LocalAnalyticsSource(workspaceFsPath());
+  return loadAnalyticsSnapshot(source);
+}
+
+async function showLearningHistory(): Promise<void> {
+  const channel = getAnalyticsChannel();
+  channel.clear();
+  let snapshot: AnalyticsSnapshot;
+  try {
+    snapshot = await loadAnalyticsSnapshotForWorkspace();
+  } catch (err) {
+    void vscode.window.showWarningMessage(`CodeSense: could not load learning history (${String(err)}).`);
+    return;
+  }
+  channel.appendLine(renderLearningHistory(snapshot, {}, new Date().toISOString()));
+  channel.show();
+}
+
+async function searchLearningHistoryFlow(): Promise<void> {
+  const query = await vscode.window.showInputBox({
+    placeHolder: 'Search problems, goals, reflections, evidence (never code)',
+    prompt: 'CodeSense: Search Learning History',
+  });
+  if (query === undefined || query.trim() === '') {
+    return;
+  }
+  let snapshot: AnalyticsSnapshot;
+  try {
+    snapshot = await loadAnalyticsSnapshotForWorkspace();
+  } catch (err) {
+    void vscode.window.showWarningMessage(`CodeSense: could not load learning history (${String(err)}).`);
+    return;
+  }
+  const results = searchLearningHistory(snapshot, query);
+  const channel = getAnalyticsChannel();
+  channel.clear();
+  channel.appendLine(`Search: "${query.trim()}" (matches titles, goal text, reflection words, evidence notes — never code)`);
+  channel.appendLine(`Problems: ${results.problems.length === 0 ? 'none' : results.problems.join(', ')}`);
+  channel.appendLine(`Goals: ${results.goals.length === 0 ? 'none' : results.goals.join(', ')}`);
+  channel.appendLine(`Reflections: ${results.reflections.length === 0 ? 'none' : results.reflections.join(', ')}`);
+  channel.appendLine(`Evidence: ${results.evidence.length === 0 ? 'none' : results.evidence.join(', ')}`);
+  if (
+    results.problems.length === 0 &&
+    results.goals.length === 0 &&
+    results.reflections.length === 0 &&
+    results.evidence.length === 0
+  ) {
+    channel.appendLine('No record found for this search.');
+  }
+  channel.show();
+}
+
+async function showGoalProgressFlow(): Promise<void> {
+  let snapshot: AnalyticsSnapshot;
+  try {
+    snapshot = await loadAnalyticsSnapshotForWorkspace();
+  } catch (err) {
+    void vscode.window.showWarningMessage(`CodeSense: could not load learning history (${String(err)}).`);
+    return;
+  }
+  if (snapshot.goals.length === 0) {
+    void vscode.window.showInformationMessage('CodeSense: no learning goals recorded yet.');
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    snapshot.goals.map((goal) => ({
+      label: `${goal.description}`,
+      description: `${goal.status}/${goal.source}`,
+      goalId: goal.goalId,
+    })),
+    { placeHolder: 'Select a goal to review its progress chain' },
+  );
+  if (!picked) {
+    return;
+  }
+  const channel = getAnalyticsChannel();
+  channel.clear();
+  channel.appendLine(renderGoalProgress(snapshot, (picked as { goalId: string }).goalId));
+  channel.show();
+}
+
+async function showConceptHistoryFlow(): Promise<void> {
+  let snapshot: AnalyticsSnapshot;
+  try {
+    snapshot = await loadAnalyticsSnapshotForWorkspace();
+  } catch (err) {
+    void vscode.window.showWarningMessage(`CodeSense: could not load learning history (${String(err)}).`);
+    return;
+  }
+  const entityIds = [...new Set(snapshot.evidence.flatMap((record) => record.entityIds))].sort();
+  if (entityIds.length === 0) {
+    void vscode.window.showInformationMessage('CodeSense: no practiced concepts recorded yet.');
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(entityIds, {
+    placeHolder: 'Select a canonical concept/pattern/form to review',
+  });
+  if (!picked) {
+    return;
+  }
+  const channel = getAnalyticsChannel();
+  channel.clear();
+  channel.appendLine(
+    renderEntityHistory(snapshot, picked, (id) => getDefaultKnowledgeGraph().hasEntity(id)),
+  );
+  channel.show();
+}
+
+async function exportLearningHistoryFlow(): Promise<void> {
+  let snapshot: AnalyticsSnapshot;
+  try {
+    snapshot = await loadAnalyticsSnapshotForWorkspace();
+  } catch (err) {
+    void vscode.window.showWarningMessage(`CodeSense: could not load learning history (${String(err)}).`);
+    return;
+  }
+  const format = await vscode.window.showQuickPick(['JSON', 'Markdown'], {
+    placeHolder: 'Select export format (JSON preserves IDs/provenance; Markdown is human-readable)',
+  });
+  if (!format) {
+    return;
+  }
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(format === 'JSON' ? 'codesense-learning-history.json' : 'codesense-learning-history.md'),
+    filters: format === 'JSON' ? { JSON: ['json'] } : { Markdown: ['md'] },
+  });
+  if (!uri) {
+    return;
+  }
+  const now = new Date().toISOString();
+  const content =
+    format === 'JSON'
+      ? JSON.stringify(exportAnalyticsJson(snapshot, {}, now), null, 2)
+      : exportAnalyticsMarkdown(snapshot, {}, now);
+  try {
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
+  } catch (err) {
+    void vscode.window.showWarningMessage(`CodeSense: could not write export (${String(err)}).`);
+    return;
+  }
+  void vscode.window.showInformationMessage(`CodeSense: learning history exported (${format}).`);
+}
+
+/** Phase H: best-effort counts-only sidebar enrichment (never blocks, never throws). */
+function refreshSidebarHistoryCounts(): void {
+  if (!sidebarProvider) {
+    return;
+  }
+  void (async () => {
+    try {
+      const snapshot = await loadAnalyticsSnapshotForWorkspace();
+      const current = sidebarProvider?.currentSnapshot();
+      if (!current) {
+        return;
+      }
+      const attempts = snapshot.attempts.filter((attempt) => attempt.completedAt !== null).length;
+      const goalsActive = snapshot.goals.filter((goal) => goal.status === 'active').length;
+      const lastSignal =
+        snapshot.progress.length === 0
+          ? null
+          : [...snapshot.progress].sort((a, b) => b.evaluatedAt.localeCompare(a.evaluatedAt))[0].progressSignal;
+      sidebarProvider?.update({ ...current, history: { attempts, goalsActive, lastSignal } });
+    } catch {
+      // Sidebar enrichment is advisory; failures stay silent by design.
+    }
+  })();
+}
+
 function refreshStatusBar(): void {
   if (!statusBar) {
     return;
@@ -495,6 +689,8 @@ function updateSidebar(): void {
     };
   }
   sidebarProvider.update(snapshot);
+  // Phase H: counts-only history enrichment, fire-and-forget (never blocks UI).
+  refreshSidebarHistoryCounts();
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +1174,11 @@ async function showMenu(): Promise<void> {
   choices.push({ label: '$(target) Review Learning Goals', action: 'goals' });
   choices.push({ label: '$(zap) Suggest Next Practice Activity', action: 'practice' });
   choices.push({ label: '$(comment) Reflect on Last Attempt', action: 'reflect' });
+  choices.push({ label: '$(graph) Show Learning History', action: 'learningHistory' });
+  choices.push({ label: '$(search) Search Learning History', action: 'searchHistory' });
+  choices.push({ label: '$(target) Show Goal Progress', action: 'goalProgress' });
+  choices.push({ label: '$(symbol-method) Show Concept History', action: 'conceptHistory' });
+  choices.push({ label: '$(export) Export Learning History', action: 'exportHistory' });
   choices.push({ label: '$(list-unordered) Show Session Timeline', action: 'timeline' });
   choices.push({ label: '$(file) Show Session Data Location', action: 'location' });
   const picked = await vscode.window.showQuickPick(choices, { placeHolder: 'CodeSense' });
@@ -1011,6 +1212,21 @@ async function showMenu(): Promise<void> {
       break;
     case 'reflect':
       void reflectOnLastAttempt();
+      break;
+    case 'learningHistory':
+      void showLearningHistory();
+      break;
+    case 'searchHistory':
+      void searchLearningHistoryFlow();
+      break;
+    case 'goalProgress':
+      void showGoalProgressFlow();
+      break;
+    case 'conceptHistory':
+      void showConceptHistoryFlow();
+      break;
+    case 'exportHistory':
+      void exportLearningHistoryFlow();
       break;
     case 'timeline':
       void showTimeline();
@@ -2653,6 +2869,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const reflectDisposable = vscode.commands.registerCommand('codesense.reflectOnLastAttempt', () => {
     void reflectOnLastAttempt();
   });
+  const learningHistoryDisposable = vscode.commands.registerCommand('codesense.showLearningHistory', () => {
+    void showLearningHistory();
+  });
+  const searchHistoryDisposable = vscode.commands.registerCommand('codesense.searchLearningHistory', () => {
+    void searchLearningHistoryFlow();
+  });
+  const goalProgressDisposable = vscode.commands.registerCommand('codesense.showGoalProgress', () => {
+    void showGoalProgressFlow();
+  });
+  const conceptHistoryDisposable = vscode.commands.registerCommand('codesense.showConceptHistory', () => {
+    void showConceptHistoryFlow();
+  });
+  const exportHistoryDisposable = vscode.commands.registerCommand('codesense.exportLearningHistory', () => {
+    void exportLearningHistoryFlow();
+  });
   const menuDisposable = vscode.commands.registerCommand('codesense.showMenu', () => {
     void showMenu();
   });
@@ -2957,6 +3188,11 @@ export function activate(context: vscode.ExtensionContext): void {
     reviewGoalsDisposable,
     suggestPracticeDisposable,
     reflectDisposable,
+    learningHistoryDisposable,
+    searchHistoryDisposable,
+    goalProgressDisposable,
+    conceptHistoryDisposable,
+    exportHistoryDisposable,
     menuDisposable,
     timelineDisposable,
     locationDisposable,

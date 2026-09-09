@@ -73,11 +73,22 @@ export interface SidebarAiState {
   canReply: boolean;
 }
 
+export interface SidebarHistoryInfo {
+  /** Completed attempts (activity count, never a learning claim). */
+  attempts: number;
+  /** Active goals (F1 lifecycle state, never an assessment). */
+  goalsActive: number;
+  /** Latest progress signal observed, if any (evidence label, never mastery). */
+  lastSignal: string | null;
+}
+
 export interface SidebarSnapshot {
   session: SidebarSessionInfo | null;
   problem: SidebarProblemInfo | null;
   /** AI Layer V1 panel model; absent when no session is active. */
   ai?: SidebarAiState;
+  /** Phase H counts-only learning-history summary; absent until loaded. */
+  history?: SidebarHistoryInfo;
 }
 
 export interface SidebarSnapshotInput {
