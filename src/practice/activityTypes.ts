@@ -27,18 +27,93 @@ export const PRACTICE_PLAN_ID_PREFIX = 'plan_';
 export const PRACTICE_SEQUENCE_ID_PREFIX = 'seq_';
 
 /**
- * What kind of learning action this is. `coding-problem` is the only
- * populated kind in this slice: every candidate comes from an existing
- * Problem (never generated). The union stays extensible so future
- * recognition/debugging micro-activities can plug in without a rewrite —
- * but no second activity taxonomy is created here.
+ * What kind of learning action this is. `coding-problem` covers practice
+ * on an existing Problem (never generated, in Stage 0). `debugging-task`
+ * covers a code-artifact debugging activity: the learner edits and runs
+ * code exactly like a coding problem, so the existing attempt lifecycle,
+ * telemetry, D evidence feeds, F3 attribution, and H history all apply
+ * unchanged — only the task payload differs (broken code + reference fix
+ * + tests instead of a problem statement). No second activity taxonomy is
+ * created here; `micro-task` and any other kind remain rejected.
  */
-export type ActivityKind = 'coding-problem';
+export type ActivityKind = 'coding-problem' | 'debugging-task';
 
-export const ACTIVITY_KINDS: readonly ActivityKind[] = ['coding-problem'];
+export const ACTIVITY_KINDS: readonly ActivityKind[] = ['coding-problem', 'debugging-task'];
 
 export function isKnownActivityKind(value: unknown): value is ActivityKind {
-  return value === 'coding-problem';
+  return value === 'coding-problem' || value === 'debugging-task';
+}
+
+/**
+ * Kind-specific payload for `debugging-task` plans. The broken code is an
+ * artifact to diagnose (not learner-authored evidence); the reference fix
+ * and tests define what "fixed" means for future validation. Bounded like
+ * every other stored plan field; validators reject over-long input.
+ */
+export interface DebuggingTaskPayload {
+  /** The broken code the learner must diagnose (artifact, never evidence). */
+  brokenSnapshot: string;
+  /** Optional open-vocabulary fault label (`off-by-one`, ...). */
+  faultKind?: string;
+  /** Reference fixed code defining the accepted outcome. */
+  referenceFix: string;
+  /** Test descriptions defining what "fixed" means (prose, bounded). */
+  tests: string[];
+}
+
+/** Bounds keep debugging payloads finite; validators reject over-long input. */
+export const MAX_DEBUG_SNAPSHOT_CHARS = 6000;
+export const MAX_DEBUG_TEXT_CHARS = 280;
+export const MAX_DEBUG_TESTS = 24;
+export const MAX_DEBUG_TEST_CHARS = 500;
+
+function isNonBlankBounded(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= max;
+}
+
+function isFaultKind(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_DEBUG_TEXT_CHARS &&
+    /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value)
+  );
+}
+
+/**
+ * Strict validation for debugging-task payloads (store writes and future
+ * generation seams). Returns the normalized payload or null — callers drop
+ * invalid payloads loudly, never persist half-shaped plans. Pure function.
+ */
+export function validateDebuggingTaskPayload(raw: unknown): DebuggingTaskPayload | null {
+  if (typeof raw !== 'object' || raw === null) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  if (!isNonBlankBounded(record.brokenSnapshot, MAX_DEBUG_SNAPSHOT_CHARS)) {
+    return null;
+  }
+  if (!isNonBlankBounded(record.referenceFix, MAX_DEBUG_SNAPSHOT_CHARS)) {
+    return null;
+  }
+  const tests: unknown = record.tests;
+  if (
+    !Array.isArray(tests) ||
+    tests.length === 0 ||
+    tests.length > MAX_DEBUG_TESTS ||
+    tests.some((t: unknown) => !isNonBlankBounded(t, MAX_DEBUG_TEST_CHARS))
+  ) {
+    return null;
+  }
+  if (record.faultKind !== undefined && !isFaultKind(record.faultKind)) {
+    return null;
+  }
+  return {
+    brokenSnapshot: record.brokenSnapshot as string,
+    ...(typeof record.faultKind === 'string' ? { faultKind: record.faultKind as string } : {}),
+    referenceFix: record.referenceFix as string,
+    tests: [...(tests as string[])],
+  };
 }
 
 /**
@@ -192,9 +267,20 @@ export interface ActivityPlan {
   /** The goal's canonical dedup key at plan time (traceability, not identity). */
   goalTargetKey: string;
   activityKind: ActivityKind;
-  /** Existing problem identity (never generated, never invented). */
+  /**
+   * Problem context identity (never generated, never invented). For
+   * `coding-problem` this is the practiced problem; for `debugging-task`
+   * this is the problem whose code is being debugged, so the existing
+   * `linkedAttemptId` problem-match validation applies unchanged.
+   */
   problemId: string;
   problemTitle: string | null;
+  /**
+   * Kind-specific payload. Required exactly when `activityKind` is
+   * `debugging-task`; forbidden on `coding-problem` (mirrors the frozen
+   * conditional-field pattern, e.g. D `helpLevel`/`mistakeCategory`).
+   */
+  debugPayload?: DebuggingTaskPayload;
   intent: ActivityIntent;
   purpose: ActivityPurpose;
   /** Canonical Phase C entity IDs this activity targets (subset of the goal's, non-empty). */
@@ -221,6 +307,13 @@ export interface ActivityPlan {
   sequenceId: string;
   /** The attempt started from this plan, once one exists. Null until linked. */
   linkedAttemptId: string | null;
+  /**
+   * I-generation artifact filling this slot, when F2's request was served
+   * by generation. Absent for catalog-selected activities. Attached only
+   * via the I-4 seam (I-3-passed, execution-unverified candidates only);
+   * the plan lifecycle and ownership stay entirely F2's.
+   */
+  generatedArtifact?: GeneratedArtifact;
   provenance: {
     ontologyVersion: string;
     aggregatorVersion: string;
@@ -233,6 +326,70 @@ export interface ActivityPlan {
 export interface ActivityWordingCandidate {
   rationale?: string;
   expectedEvidence?: string;
+}
+
+/**
+ * I-generation artifact attached to an F2 plan slot. Identity triple
+ * (candidate/spec/request) plus the presentation content a future attempt
+ * flow needs; debugging-task code content additionally mirrors into the
+ * plan-native `debugPayload` so existing consumers see a normal debugging
+ * plan. The artifact never duplicates plan ownership: kind must equal the
+ * plan kind, and only an I-3-passed, execution-unverified candidate may be
+ * attached (enforced by the I-4 seam, not here).
+ */
+export interface GeneratedArtifact {
+  candidateId: string;
+  specId: string;
+  requestId: string;
+  kind: ActivityKind;
+  title: string;
+  taskDescription: string;
+}
+
+/** Bounds keep generated artifacts finite; validators reject over-long input. */
+export const MAX_GENERATED_ID_CHARS = 120;
+export const MAX_GENERATED_TITLE_CHARS = 280;
+export const MAX_GENERATED_STATEMENT_CHARS = 6000;
+
+function isArtifactNonBlankBounded(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= max;
+}
+
+/**
+ * Strict validation for a generated artifact against its plan kind.
+ * Returns the normalized artifact or null. Pure function.
+ */
+export function validateGeneratedArtifact(raw: unknown, planKind: ActivityKind): GeneratedArtifact | null {
+  if (typeof raw !== 'object' || raw === null) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  if (!isArtifactNonBlankBounded(record.candidateId, MAX_GENERATED_ID_CHARS)) {
+    return null;
+  }
+  if (!isArtifactNonBlankBounded(record.specId, MAX_GENERATED_ID_CHARS)) {
+    return null;
+  }
+  if (!isArtifactNonBlankBounded(record.requestId, MAX_GENERATED_ID_CHARS)) {
+    return null;
+  }
+  if (record.kind !== planKind) {
+    return null;
+  }
+  if (!isArtifactNonBlankBounded(record.title, MAX_GENERATED_TITLE_CHARS)) {
+    return null;
+  }
+  if (!isArtifactNonBlankBounded(record.taskDescription, MAX_GENERATED_STATEMENT_CHARS)) {
+    return null;
+  }
+  return {
+    candidateId: record.candidateId as string,
+    specId: record.specId as string,
+    requestId: record.requestId as string,
+    kind: planKind,
+    title: record.title as string,
+    taskDescription: record.taskDescription as string,
+  };
 }
 
 /** Bounds keep stored plan text finite; validators reject over-long input. */

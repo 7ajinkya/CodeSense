@@ -1103,6 +1103,13 @@ describe('Phase F2 scope guard (no I/G/H/I/J surface)', () => {
       'ACTIVITY_PLAN_STATUSES',
       'ACTIVITY_PLAN_TRANSITIONS',
       'ACTIVITY_PURPOSES',
+      'MAX_DEBUG_SNAPSHOT_CHARS',
+      'MAX_DEBUG_TESTS',
+      'MAX_DEBUG_TEST_CHARS',
+      'MAX_DEBUG_TEXT_CHARS',
+      'MAX_GENERATED_ID_CHARS',
+      'MAX_GENERATED_STATEMENT_CHARS',
+      'MAX_GENERATED_TITLE_CHARS',
       'MAX_PLAN_EVIDENCE_IDS',
       'MAX_PLAN_RATIONALE_CHARS',
       'MAX_PLAN_SEQUENCE_LENGTH',
@@ -1117,6 +1124,8 @@ describe('Phase F2 scope guard (no I/G/H/I/J surface)', () => {
       'isKnownActivityKind',
       'isKnownActivityPlanStatus',
       'isKnownActivityPurpose',
+      'validateDebuggingTaskPayload',
+      'validateGeneratedArtifact',
     ]);
     expect(exportedKeys(activityCatalogModule)).to.deep.equal([
       'buildPracticeCatalog',

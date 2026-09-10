@@ -6,8 +6,10 @@ import {
   isKnownActivityKind,
   isKnownActivityPlanStatus,
   isKnownActivityPurpose,
+  validateDebuggingTaskPayload,
+  validateGeneratedArtifact,
 } from './activityTypes';
-import type { ActivityPlan } from './activityTypes';
+import type { ActivityPlan, DebuggingTaskPayload, GeneratedArtifact } from './activityTypes';
 
 const ACTIVITY_PLANS_FILE = 'activity-plans.json';
 
@@ -71,6 +73,28 @@ export function parseActivityPlan(raw: unknown): ActivityPlan | null {
   ) {
     return null;
   }
+  // Kind-conditional payload: debugging tasks require a valid payload;
+  // coding problems must not carry one (bad rows drop, never throw).
+  let debugPayload: DebuggingTaskPayload | undefined;
+  if (raw.activityKind === 'debugging-task') {
+    const parsed = validateDebuggingTaskPayload(raw.debugPayload);
+    if (parsed === null) {
+      return null;
+    }
+    debugPayload = parsed;
+  } else if (raw.debugPayload !== undefined) {
+    return null;
+  }
+  // I-generation artifact: optional; when present it must validate against
+  // the plan kind (bad rows drop, never throw).
+  let generatedArtifact: GeneratedArtifact | undefined;
+  if (raw.generatedArtifact !== undefined) {
+    const parsed = validateGeneratedArtifact(raw.generatedArtifact, raw.activityKind as ActivityPlan['activityKind']);
+    if (parsed === null) {
+      return null;
+    }
+    generatedArtifact = parsed;
+  }
   return {
     planId: raw.planId,
     goalId: raw.goalId,
@@ -93,6 +117,10 @@ export function parseActivityPlan(raw: unknown): ActivityPlan | null {
     },
     expectedEvidence: raw.expectedEvidence,
     expectedEvidenceTypes: [...(raw.expectedEvidenceTypes as EvidenceType[])],
+    ...(debugPayload !== undefined
+      ? { debugPayload: { ...debugPayload, tests: [...debugPayload.tests] } }
+      : {}),
+    ...(generatedArtifact !== undefined ? { generatedArtifact: { ...generatedArtifact } } : {}),
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
     status: raw.status,

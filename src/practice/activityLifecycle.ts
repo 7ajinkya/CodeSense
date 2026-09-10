@@ -23,6 +23,10 @@ export function transitionPlanStatus(plan: ActivityPlan, to: ActivityPlanStatus,
     updatedAt: now,
     entityIds: [...plan.entityIds],
     expectedEvidenceTypes: [...plan.expectedEvidenceTypes],
+    ...(plan.debugPayload !== undefined
+      ? { debugPayload: { ...plan.debugPayload, tests: [...plan.debugPayload.tests] } }
+      : {}),
+    ...(plan.generatedArtifact !== undefined ? { generatedArtifact: { ...plan.generatedArtifact } } : {}),
     evidenceBasis: { ...plan.evidenceBasis, evidenceIds: [...plan.evidenceBasis.evidenceIds] },
     provenance: { ...plan.provenance },
   };
@@ -71,6 +75,10 @@ export function linkAttemptToPlan(plan: ActivityPlan, attempt: Attempt, now: str
     updatedAt: now,
     entityIds: [...plan.entityIds],
     expectedEvidenceTypes: [...plan.expectedEvidenceTypes],
+    ...(plan.debugPayload !== undefined
+      ? { debugPayload: { ...plan.debugPayload, tests: [...plan.debugPayload.tests] } }
+      : {}),
+    ...(plan.generatedArtifact !== undefined ? { generatedArtifact: { ...plan.generatedArtifact } } : {}),
     evidenceBasis: { ...plan.evidenceBasis, evidenceIds: [...plan.evidenceBasis.evidenceIds] },
     provenance: { ...plan.provenance },
   };
